@@ -26,22 +26,48 @@
   <a href="#tab=compliance">Compliance &amp; Responsible AI</a> tab.
 </div>
 
-<nav class="tab-nav" role="tablist" aria-label="Guide sections">
-  <div class="tab-nav-inner">
-    <button class="tab-button" role="tab" data-tab="overview"        aria-controls="tab-overview"        id="tabbtn-overview">Overview</button>
-    <button class="tab-button" role="tab" data-tab="walkthrough"     aria-controls="tab-walkthrough"     id="tabbtn-walkthrough">End-to-End Walkthrough</button>
-    <button class="tab-button" role="tab" data-tab="script"          aria-controls="tab-script"          id="tabbtn-script">All-in-one Script</button>
-    <button class="tab-button" role="tab" data-tab="prereqs"         aria-controls="tab-prereqs"         id="tabbtn-prereqs">Prerequisites</button>
-    <button class="tab-button" role="tab" data-tab="architecture"    aria-controls="tab-architecture"    id="tabbtn-architecture">Architecture</button>
-    <button class="tab-button" role="tab" data-tab="dicom"           aria-controls="tab-dicom"           id="tabbtn-dicom">DICOM Ingestion</button>
-    <button class="tab-button" role="tab" data-tab="deploy"          aria-controls="tab-deploy"          id="tabbtn-deploy">Deploy</button>
-    <button class="tab-button" role="tab" data-tab="test"            aria-controls="tab-test"            id="tabbtn-test">Test the Endpoint</button>
-    <button class="tab-button" role="tab" data-tab="networking"      aria-controls="tab-networking"      id="tabbtn-networking">Networking &amp; Security</button>
-    <button class="tab-button" role="tab" data-tab="compliance"      aria-controls="tab-compliance"      id="tabbtn-compliance">Compliance &amp; RAI</button>
-    <button class="tab-button" role="tab" data-tab="cost-calculator" aria-controls="tab-cost-calculator" id="tabbtn-cost-calculator">Cost Calculator</button>
-    <button class="tab-button" role="tab" data-tab="ops"             aria-controls="tab-ops"             id="tabbtn-ops">Monitoring &amp; Ops</button>
-    <button class="tab-button" role="tab" data-tab="troubleshooting" aria-controls="tab-troubleshooting" id="tabbtn-troubleshooting">Troubleshooting</button>
-    <button class="tab-button" role="tab" data-tab="references"      aria-controls="tab-references"      id="tabbtn-references">References</button>
+<nav class="tab-nav" aria-label="Guide sections">
+  <div class="tab-nav-inner" role="menubar">
+    <div class="nav-group" data-group="start">
+      <button class="nav-group-toggle" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false" aria-controls="menu-start">Start</button>
+      <div class="nav-group-menu" id="menu-start" role="menu" aria-label="Start">
+        <button class="tab-button" role="tab" data-tab="overview"     aria-controls="tab-overview"     id="tabbtn-overview">Overview</button>
+        <button class="tab-button" role="tab" data-tab="prereqs"      aria-controls="tab-prereqs"      id="tabbtn-prereqs">Prerequisites</button>
+        <button class="tab-button" role="tab" data-tab="architecture" aria-controls="tab-architecture" id="tabbtn-architecture">Architecture</button>
+      </div>
+    </div>
+    <div class="nav-group" data-group="deploy">
+      <button class="nav-group-toggle" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false" aria-controls="menu-deploy">Deploy</button>
+      <div class="nav-group-menu" id="menu-deploy" role="menu" aria-label="Deploy">
+        <button class="tab-button" role="tab" data-tab="walkthrough" aria-controls="tab-walkthrough" id="tabbtn-walkthrough">End-to-End Walkthrough</button>
+        <button class="tab-button" role="tab" data-tab="script"      aria-controls="tab-script"      id="tabbtn-script">All-in-one Script</button>
+        <button class="tab-button" role="tab" data-tab="deploy"      aria-controls="tab-deploy"      id="tabbtn-deploy">Deploy</button>
+      </div>
+    </div>
+    <div class="nav-group" data-group="use">
+      <button class="nav-group-toggle" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false" aria-controls="menu-use">Use</button>
+      <div class="nav-group-menu" id="menu-use" role="menu" aria-label="Use">
+        <button class="tab-button" role="tab" data-tab="dicom" aria-controls="tab-dicom" id="tabbtn-dicom">DICOM Ingestion</button>
+        <button class="tab-button" role="tab" data-tab="test"  aria-controls="tab-test"  id="tabbtn-test">Test the Endpoint</button>
+      </div>
+    </div>
+    <div class="nav-group" data-group="operate">
+      <button class="nav-group-toggle" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false" aria-controls="menu-operate">Operate</button>
+      <div class="nav-group-menu" id="menu-operate" role="menu" aria-label="Operate">
+        <button class="tab-button" role="tab" data-tab="networking"      aria-controls="tab-networking"      id="tabbtn-networking">Networking &amp; Security</button>
+        <button class="tab-button" role="tab" data-tab="ops"             aria-controls="tab-ops"             id="tabbtn-ops">Monitoring &amp; Ops</button>
+        <button class="tab-button" role="tab" data-tab="troubleshooting" aria-controls="tab-troubleshooting" id="tabbtn-troubleshooting">Troubleshooting</button>
+      </div>
+    </div>
+    <div class="nav-group" data-group="plan">
+      <button class="nav-group-toggle" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false" aria-controls="menu-plan">Plan &amp; Govern</button>
+      <div class="nav-group-menu" id="menu-plan" role="menu" aria-label="Plan and Govern">
+        <button class="tab-button" role="tab" data-tab="cost-calculator" aria-controls="tab-cost-calculator" id="tabbtn-cost-calculator">Cost Calculator</button>
+        <button class="tab-button" role="tab" data-tab="compliance"      aria-controls="tab-compliance"      id="tabbtn-compliance">Compliance &amp; RAI</button>
+        <button class="tab-button" role="tab" data-tab="references"      aria-controls="tab-references"      id="tabbtn-references">References</button>
+      </div>
+    </div>
+    <div class="nav-current" aria-live="polite"></div>
   </div>
 </nav>
 <div class="tab-select-wrap">
