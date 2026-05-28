@@ -47,9 +47,10 @@
     <div class="nav-group" data-group="use">
       <button class="nav-group-toggle" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false" aria-controls="menu-use">Use</button>
       <div class="nav-group-menu" id="menu-use" role="menu" aria-label="Use">
-        <button class="tab-button" role="tab" data-tab="pacs"  aria-controls="tab-pacs"  id="tabbtn-pacs">Vue PACS &amp; Epic</button>
-        <button class="tab-button" role="tab" data-tab="dicom" aria-controls="tab-dicom" id="tabbtn-dicom">DICOM Ingestion</button>
-        <button class="tab-button" role="tab" data-tab="test"  aria-controls="tab-test"  id="tabbtn-test">Test the Endpoint</button>
+        <button class="tab-button" role="tab" data-tab="pacs"     aria-controls="tab-pacs"     id="tabbtn-pacs">Vue PACS &amp; Epic</button>
+        <button class="tab-button" role="tab" data-tab="listener" aria-controls="tab-listener" id="tabbtn-listener">DICOM Listener</button>
+        <button class="tab-button" role="tab" data-tab="dicom"    aria-controls="tab-dicom"    id="tabbtn-dicom">DICOM Ingestion</button>
+        <button class="tab-button" role="tab" data-tab="test"     aria-controls="tab-test"     id="tabbtn-test">Test the Endpoint</button>
       </div>
     </div>
     <div class="nav-group" data-group="operate">
@@ -80,6 +81,7 @@
     <option value="prereqs">Prerequisites</option>
     <option value="architecture">Architecture</option>
     <option value="pacs">Vue PACS &amp; Epic</option>
+    <option value="listener">DICOM Listener</option>
     <option value="dicom">DICOM Ingestion</option>
     <option value="deploy">Deploy</option>
     <option value="test">Test the Endpoint</option>
@@ -1700,6 +1702,297 @@ python epic_imagingstudy_pull.py --modality CR,DX --interval 60</code></pre>
     <li><a href="https://fhir.epic.com/Specifications?api=10005" target="_blank" rel="noopener">Epic FHIR R4 ImagingStudy spec</a> and <a href="https://fhir.epic.com/Documentation?docId=oauth2&amp;section=BackendOAuth2Guide" target="_blank" rel="noopener">Backend Services OAuth2 guide</a>.</li>
     <li><a href="https://www.philips.com/healthcare/product/HCNOCTN330/vue-pacs-enterprise-imaging" target="_blank" rel="noopener">Philips Vue PACS (Enterprise Imaging)</a> &mdash; vendor product page. Detailed DICOMweb conformance is in the Philips Vue PACS DICOM Conformance Statement (request through your Philips account team).</li>
     <li><a href="https://learn.microsoft.com/en-us/azure/healthcare-apis/dicom/overview" target="_blank" rel="noopener">Azure Health Data Services DICOM service</a> &mdash; if you want a managed DICOMweb relay.</li>
+  </ul>
+</section>
+
+<!-- =================== DICOM Listener (push) =================== -->
+<section class="tab-panel" id="tab-listener" role="tabpanel" aria-labelledby="tabbtn-listener" tabindex="-1">
+  <h1>DICOM Listener &mdash; receive studies pushed from the PACS</h1>
+  <p class="lede">Most production hospital workflows are <strong>push</strong>: the technologist completes a study at the modality, the PACS marks it final, and the PACS auto-routes a copy to one or more configured destinations. To plug CXRReportGen into that workflow you need a destination that <em>listens</em> for inbound studies, lands them in <code>dicom-input</code> blob, and hands off to the inference worker. <strong>Service Bus is the decoupling layer</strong> between the listener (ingestion) and the worker (inference).</p>
+
+  <div class="callout callout-info">
+    <p><strong>Push vs pull.</strong> The <a href="#tab=pacs">Vue PACS &amp; Epic</a> tab covers the <em>pull</em> patterns (your worker polls QIDO-RS or FHIR <code>ImagingStudy</code>). This tab covers the <em>push</em> pattern (the PACS sends to you). Push is preferred whenever the PACS can be configured to auto-route &mdash; lower latency, no polling churn, no missed updates, easy to add as a new destination AE without touching existing study workflows.</p>
+  </div>
+
+  <h2>Topology</h2>
+<pre><code class="language-mermaid">flowchart LR
+  subgraph HOSP ["Hospital network"]
+    MOD["CR / DX modality"]
+    PACS[("Philips Vue PACS")]
+    MOD -->|DIMSE C-STORE| PACS
+  end
+
+  subgraph AZ ["Azure subscription - Foundry RG"]
+    direction LR
+    LISTEN["DICOM listener - AHDS or Container App"]
+    BLOB[("dicom-input blob")]
+    EG{"Event Grid"}
+    SB[["Service Bus queue cxr-studies"]]
+    WORKER["CXR worker - Container App with KEDA"]
+    EP[["CxrReportGen online endpoint"]]
+    OUT[("cxr-reports blob")]
+    LISTEN -->|write dcm| BLOB
+    BLOB -->|BlobCreated| EG
+    EG -->|Subscription| SB
+    SB -->|pull msgs| WORKER
+    WORKER -->|invoke| EP
+    WORKER -->|write JSON| OUT
+  end
+
+  PACS -. C-STORE auto-route over VPN .-> LISTEN
+
+  classDef ext fill:#fff3cd,stroke:#b08800
+  class HOSP ext
+</code></pre>
+
+  <p>Two arrow-of-action: <strong>(1)</strong> the listener exists only to land bytes safely &mdash; it does no inference; <strong>(2)</strong> the Service Bus queue absorbs burstiness so the CXR endpoint and worker can scale on their own schedule (KEDA can scale the worker on queue depth, including down to zero overnight).</p>
+
+  <h2>Pick a listener flavor</h2>
+  <p>Three options, all of which write to the same <code>dicom-input</code> container and post to the same Service Bus queue, so the worker downstream is unchanged:</p>
+
+  <table>
+    <thead>
+      <tr><th>Option</th><th>Protocol</th><th>Best for</th><th>You operate</th><th>Approx. cost (idle/typical)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1. AHDS DICOM service</strong></td>
+        <td>STOW-RS (HTTPS)</td>
+        <td>PACS that speaks DICOMweb (Philips Vue, Sectra, GE Centricity); fastest to stand up; PHI-grade managed; native change feed</td>
+        <td>Nothing &mdash; PaaS</td>
+        <td>$0.40 / 1M requests + $0.018 / GB-month stored</td>
+      </tr>
+      <tr>
+        <td><strong>2. pynetdicom C-STORE SCP</strong> on Container Apps (TCP ingress)</td>
+        <td>DIMSE (TCP, port 11112)</td>
+        <td>Older PACS, DR systems, modality push that only speaks DIMSE; need AE Title control; can do DICOM-over-TLS</td>
+        <td>~150 lines of Python in a container</td>
+        <td>~$30/month (1 vCPU / 2 GiB always-on small replica)</td>
+      </tr>
+      <tr>
+        <td><strong>3. Custom STOW-RS</strong> on Container Apps (HTTPS ingress)</td>
+        <td>STOW-RS (HTTPS)</td>
+        <td>You want STOW-RS but with custom auth (bearer token, mTLS) or custom routing rules AHDS doesn't expose</td>
+        <td>~120 lines of FastAPI in a container</td>
+        <td>~$20/month (scales to zero on Consumption plan)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The <strong>recommended default is Option 1 (AHDS DICOM service)</strong>: it's the only one that's PHI-grade managed out-of-the-box, ships with audit logs to Log Analytics, and you don't operate a container. Drop to Option 2 only when the PACS literally cannot speak DICOMweb. Option 3 is for the (rare) case where you need custom auth that AHDS doesn't expose.</p>
+
+  <h2>Choose &amp; implement</h2>
+  <div class="inner-tabs" data-inner-name="listener">
+    <button class="inner-tab-btn active" data-inner="ahds" type="button">Option 1 &mdash; AHDS DICOM service</button>
+    <button class="inner-tab-btn" data-inner="dimse" type="button">Option 2 &mdash; pynetdicom C-STORE SCP</button>
+    <button class="inner-tab-btn" data-inner="stow" type="button">Option 3 &mdash; Custom STOW-RS</button>
+  </div>
+
+  <div class="inner-tab-panel active" data-inner="ahds">
+    <h3>Option 1 &mdash; Azure Health Data Services DICOM service</h3>
+    <p>Fully-managed DICOMweb STOW-RS / WADO-RS / QIDO-RS endpoint with the change feed plugged straight into Event Grid. Your &quot;listener&quot; is the Azure service; you only stand up the destination wiring.</p>
+
+    <h4>L1 &mdash; Create the AHDS workspace + DICOM service</h4>
+<pre><code class="language-bash">RG=cxr-rg
+LOC=eastus
+WS=cxr-ahds
+DCM=cxr-dicom
+
+az extension add -n healthcareapis --upgrade --only-show-errors
+az healthcareapis workspace create   -g $RG -n $WS -l $LOC
+az healthcareapis workspace dicomservice create   -g $RG --workspace-name $WS -n $DCM
+DCM_URI=$(az healthcareapis workspace dicomservice show   -g $RG --workspace-name $WS -n $DCM   --query serviceUrl -o tsv)
+echo "DICOMweb base URL: $DCM_URI"
+</code></pre>
+
+    <h4>L2 &mdash; Configure PACS destination</h4>
+    <p>In the Philips Vue PACS admin console, add a new <strong>DICOMweb destination</strong>:</p>
+    <ul>
+      <li><strong>Base URL:</strong> <code>$DCM_URI</code> (the value printed above)</li>
+      <li><strong>Auth:</strong> OAuth2 client_credentials against Entra ID. Register an Entra app, grant it <code>DICOM Data Owner</code> on the DICOM service, and give Vue PACS the client_id / client_secret.</li>
+      <li><strong>Routing rule:</strong> auto-route all <em>finalized</em> CR / DX studies (filter by SOP class) to this destination. Verify the rule with a single test study before opening the firehose.</li>
+    </ul>
+
+    <h4>L3 &mdash; Wire change feed &rarr; Event Grid &rarr; Service Bus &rarr; worker</h4>
+<pre><code class="language-bash">SB_NS=cxr-bus-$RANDOM
+SB_QUEUE=cxr-studies
+ID=cxr-uami    # user-assigned managed identity used by the worker
+
+# Service Bus namespace + sessions-enabled queue
+az servicebus namespace create -g $RG -n $SB_NS -l $LOC --sku Standard
+az servicebus queue create -g $RG --namespace-name $SB_NS -n $SB_QUEUE   --enable-session true --max-delivery-count 10   --lock-duration PT2M --default-message-time-to-live P1D
+
+# Event Grid system topic on the AHDS DICOM service - emits ImageStored events
+DCM_RID=$(az healthcareapis workspace dicomservice show   -g $RG --workspace-name $WS -n $DCM --query id -o tsv)
+SB_RID=$(az servicebus queue show -g $RG --namespace-name $SB_NS -n $SB_QUEUE --query id -o tsv)
+
+az eventgrid system-topic create -g $RG -n cxr-dicom-topic   --topic-type Microsoft.HealthcareApis.DicomServices --source $DCM_RID -l $LOC
+
+az eventgrid system-topic event-subscription create   -g $RG --system-topic-name cxr-dicom-topic -n cxr-imagestored-sub   --endpoint-type servicebusqueue --endpoint $SB_RID   --included-event-types "Microsoft.HealthcareApis.DicomImageCreated"
+</code></pre>
+    <p>From here the existing worker sample (<a href="assets/samples/sb_worker.py" target="_blank" rel="noopener"><code>sb_worker.py</code></a>) pulls each <code>DicomImageCreated</code> message, fetches the instance via WADO-RS (or copies it to the existing <code>dicom-input</code> container), invokes the CxrReportGen endpoint, and writes the JSON report to <code>cxr-reports</code>.</p>
+
+    <p><strong>Why this is the recommended default:</strong> AHDS is the only option here that ships with PHI-grade audit, customer-managed keys, private endpoints, and a managed change feed. You're not patching a Python container.</p>
+  </div>
+
+  <div class="inner-tab-panel" data-inner="dimse">
+    <h3>Option 2 &mdash; pynetdicom C-STORE SCP in Container Apps</h3>
+    <p>Use this when your PACS speaks classic DIMSE only. The listener is a Python process bound to TCP 11112 that registers as a Storage SCP for CR / DX SOP classes, accepts associations from whitelisted calling AE Titles, and on each C-STORE writes the SOP instance to blob + posts to Service Bus.</p>
+
+    <h4>D1 &mdash; The reference listener</h4>
+    <p>See <a href="assets/samples/dimse_listener.py" target="_blank" rel="noopener"><code>dimse_listener.py</code></a> &mdash; ~165 lines. Key bits:</p>
+    <ul>
+      <li>Built on <a href="https://pydicom.github.io/pynetdicom/" target="_blank" rel="noopener">pynetdicom 2.x</a> (pure Python, well-maintained, MIT)</li>
+      <li>Accepts <code>ComputedRadiographyImageStorage</code>, <code>DigitalXRayImagePresentationStorage</code>, <code>DigitalXRayImageProcessingStorage</code>, plus Verification (so PACS admins can DICOM-echo)</li>
+      <li>AE Title whitelist (<code>ALLOWED_CALLING_AES</code> env) rejects unknown PACS with status <code>0x0122</code></li>
+      <li>Optional DICOM-over-TLS via <code>TLS_CERT</code> / <code>TLS_KEY</code> env paths (mount from Key Vault using the CSI driver)</li>
+      <li>Blob path is <code>{StudyInstanceUID}/{SeriesInstanceUID}/{SOPInstanceUID}.dcm</code> so the worker can group SOP instances per study cheaply</li>
+      <li>Service Bus message uses <code>session_id = StudyInstanceUID</code> so the worker can receive an entire study together</li>
+      <li>Uses <code>DefaultAzureCredential</code> &mdash; no connection strings in the container</li>
+    </ul>
+
+    <h4>D2 &mdash; Container image</h4>
+    <p>The included <a href="assets/samples/listener.Dockerfile" target="_blank" rel="noopener"><code>listener.Dockerfile</code></a> builds a python:3.12-slim image with pynetdicom + the three Azure SDKs. Build it with ACR build (no local Docker needed):</p>
+<pre><code class="language-bash">ACR=cxracr
+az acr create -g $RG -n $ACR --sku Basic
+az acr build --registry $ACR   --image cxr-dimse-listener:1.0   --file docs/assets/samples/listener.Dockerfile   docs/assets/samples
+</code></pre>
+
+    <h4>D3 &mdash; Container Apps deployment with TCP ingress</h4>
+    <p>Container Apps supports raw TCP ingress (since 2023) &mdash; perfect for the non-HTTP DIMSE protocol. Make the environment <strong>internal-only</strong> (workload-profiles SKU on a subnet you control) and put the PACS on the other end of a VPN or ExpressRoute.</p>
+<pre><code class="language-bash">ACA_ENV=cxr-listener-env
+SUBNET_ID=/subscriptions/.../resourceGroups/$RG/providers/Microsoft.Network/virtualNetworks/cxr-vnet/subnets/listeners
+
+az containerapp env create   -g $RG -n $ACA_ENV -l $LOC --internal-only true   --infrastructure-subnet-resource-id $SUBNET_ID
+
+# UAMI for managed identity to storage + Service Bus
+ID_ID=$(az identity create -g $RG -n cxr-listener-uami --query id -o tsv)
+ID_CID=$(az identity show -g $RG -n cxr-listener-uami --query clientId -o tsv)
+SA_RID=$(az storage account show -g $RG -n cxrstorage --query id -o tsv)
+az role assignment create --assignee $ID_CID --role "Storage Blob Data Contributor" --scope $SA_RID
+az role assignment create --assignee $ID_CID --role "Azure Service Bus Data Sender" --scope $SB_RID
+
+az containerapp create   -g $RG -n cxr-dimse-listener --environment $ACA_ENV   --image $ACR.azurecr.io/cxr-dimse-listener:1.0   --user-assigned $ID_ID --registry-server $ACR.azurecr.io --registry-identity $ID_ID   --ingress internal --transport tcp --target-port 11112 --exposed-port 11112   --min-replicas 1 --max-replicas 3   --env-vars STORAGE_ACCOUNT=cxrstorage SB_FQDN=$SB_NS.servicebus.windows.net           SB_QUEUE=$SB_QUEUE AE_TITLE=CXR-INTAKE           ALLOWED_CALLING_AES=VUEPACS_PROD,VUEPACS_DR           AZURE_CLIENT_ID=$ID_CID
+</code></pre>
+    <p>The internal FQDN will look like <code>cxr-dimse-listener.internal.&lt;envid&gt;.eastus.azurecontainerapps.io</code>. Resolve it from the on-prem side via your VPN's private DNS and configure that as the destination AE in the PACS.</p>
+
+    <h4>D4 &mdash; Configure the PACS destination</h4>
+    <ul>
+      <li><strong>Destination AE Title:</strong> <code>CXR-INTAKE</code> (match the <code>AE_TITLE</code> env)</li>
+      <li><strong>Host / port:</strong> the internal FQDN above on TCP 11112</li>
+      <li><strong>Calling AE Title:</strong> must be in <code>ALLOWED_CALLING_AES</code> &mdash; e.g. <code>VUEPACS_PROD</code></li>
+      <li><strong>Routing rule:</strong> auto-route finalized CR / DX studies (the rule lives in Vue PACS, not in our listener &mdash; we just receive what the PACS sends)</li>
+      <li><strong>Sanity check:</strong> from the PACS admin shell run <code>echoscu -aet VUEPACS_PROD -aec CXR-INTAKE &lt;listener-fqdn&gt; 11112</code> &mdash; should print <code>Received Echo Response</code></li>
+    </ul>
+  </div>
+
+  <div class="inner-tab-panel" data-inner="stow">
+    <h3>Option 3 &mdash; Custom STOW-RS endpoint on Container Apps</h3>
+    <p>The middle ground: you want STOW-RS (modern, HTTPS, easy to inspect) but with custom auth or routing logic AHDS doesn't expose. The included <a href="assets/samples/stow_listener.py" target="_blank" rel="noopener"><code>stow_listener.py</code></a> is a ~120-line FastAPI app that implements just <code>POST /studies</code> and <code>POST /studies/{study_uid}</code> per DICOM PS3.18 STOW-RS.</p>
+
+    <h4>S1 &mdash; What it does</h4>
+    <ul>
+      <li>Accepts <code>multipart/related; type=application/dicom</code></li>
+      <li>Splits the multipart with <code>requests-toolbelt</code></li>
+      <li>For each part: parses with <code>pydicom</code>, writes to <code>{study}/{series}/{sop}.dcm</code> in blob, posts a Service Bus message with <code>session_id = StudyInstanceUID</code></li>
+      <li>Optional shared bearer token (<code>REQUIRED_BEARER_TOKEN</code> env) so the PACS can authenticate without OAuth</li>
+      <li>Returns the minimal <code>&lt;NativeDicomModel&gt;</code> XML response that PS3.18 specifies</li>
+    </ul>
+
+    <h4>S2 &mdash; Deploy on Container Apps with HTTPS ingress</h4>
+<pre><code class="language-bash">az containerapp create   -g $RG -n cxr-stow-listener --environment $ACA_ENV   --image $ACR.azurecr.io/cxr-stow-listener:1.0   --user-assigned $ID_ID --registry-server $ACR.azurecr.io --registry-identity $ID_ID   --ingress internal --transport auto --target-port 8080   --min-replicas 0 --max-replicas 10   --env-vars STORAGE_ACCOUNT=cxrstorage SB_FQDN=$SB_NS.servicebus.windows.net           SB_QUEUE=$SB_QUEUE           REQUIRED_BEARER_TOKEN=secretref:pacs-bearer           AZURE_CLIENT_ID=$ID_CID   --secrets pacs-bearer=$(uuidgen)
+</code></pre>
+    <p>HTTPS termination is handled by Container Apps. Configure the PACS to POST to <code>https://&lt;fqdn&gt;/studies</code> with <code>Authorization: Bearer &lt;the secret you set&gt;</code>.</p>
+
+    <p><strong>Why not AHDS?</strong> Pick this option only when you need behavior AHDS doesn't give you &mdash; e.g. a bespoke routing rule that re-tags <code>InstitutionName</code> on the fly, or a non-Entra auth model. Otherwise AHDS is less work to operate.</p>
+  </div>
+
+  <h2>The Service Bus backbone (shared across all three options)</h2>
+  <p>The queue is what makes the whole pipeline survivable. Worth understanding the choices:</p>
+  <table>
+    <thead>
+      <tr><th>Decision</th><th>Choice</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Queue vs topic</td>
+        <td><strong>Queue</strong> (one queue, one worker pool)</td>
+        <td>One consumer pattern. Use a topic only if you need multiple downstream pipelines (e.g. CXR + RAI evaluator + research export) from the same study stream.</td>
+      </tr>
+      <tr>
+        <td>Sessions</td>
+        <td><strong>Enabled</strong> &mdash; <code>session_id = StudyInstanceUID</code></td>
+        <td>A study trickles in as multiple C-STOREs over seconds. Sessions let the worker receive all SOP instances of one study together so it can pick the frontal view deterministically.</td>
+      </tr>
+      <tr>
+        <td>SKU</td>
+        <td><strong>Standard</strong> (sessions + DLQ + 30-day messages)</td>
+        <td>Basic doesn't support sessions. Premium is overkill until you're past ~1M messages/day or need VNet integration; switch then.</td>
+      </tr>
+      <tr>
+        <td>Lock duration</td>
+        <td><strong>PT2M</strong>, max delivery <strong>10</strong></td>
+        <td>2 min is plenty for the worker to download + call the endpoint. 10 deliveries lets transient AML 429s/503s retry before DLQ.</td>
+      </tr>
+      <tr>
+        <td>TTL</td>
+        <td><strong>1 day</strong></td>
+        <td>If a study sits longer than 24h it's stale &mdash; either inference is broken or the radiologist already wrote the report. DLQ surfaces it for operator review.</td>
+      </tr>
+      <tr>
+        <td>Worker scaling</td>
+        <td><strong>KEDA <code>azure-servicebus</code> scaler</strong> on queue length</td>
+        <td>Container Apps has KEDA built in. Scale-to-zero when idle, scale up to your AML endpoint concurrency cap when bursty.</td>
+      </tr>
+      <tr>
+        <td>Dead-letter</td>
+        <td><strong>On</strong> + alert on count &gt; 0</td>
+        <td>Malformed DICOM, missing SOP class, endpoint outage &rarr; visible signal, not a silent drop.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The included <a href="assets/samples/sb_worker.py" target="_blank" rel="noopener"><code>sb_worker.py</code></a> implements the consumer side: accept-session, gather instances for <code>SESSION_GATHER_SECONDS</code>, pick the PA/AP frontal view, base64-encode the PNG, invoke the CxrReportGen endpoint, write JSON to <code>cxr-reports</code>. Complete each message after handoff so a worker crash mid-inference re-delivers on its own.</p>
+
+  <h2>Networking &amp; security &mdash; non-negotiable</h2>
+  <ul>
+    <li><strong>Don't expose the listener to the public internet.</strong> AHDS supports private endpoints. Container Apps internal-only env keeps the FQDN private. Reach it from on-prem via S2S VPN or ExpressRoute &mdash; never via a public IP with an allowlist.</li>
+    <li><strong>DICOM-over-TLS for DIMSE</strong> (Option 2). Cert from Key Vault, rotated, with the PACS configured to require TLS on the association. Plain DICOM is unencrypted PHI in flight.</li>
+    <li><strong>AE Title whitelisting</strong> on the C-STORE SCP. Default-deny.</li>
+    <li><strong>Calling AE address verification</strong>: also pin the calling host IP at the NSG (or Container Apps env access restriction) so a rogue process can't pretend to be the PACS by spoofing AE Title.</li>
+    <li><strong>Managed identity everywhere.</strong> Listener &rarr; storage / Service Bus uses UAMI; worker &rarr; storage / Service Bus / AML uses UAMI. No connection strings, no keys in env, no secrets in container images.</li>
+    <li><strong>Customer-managed keys</strong> on the storage account and the Service Bus namespace (Premium SKU required for SB CMK).</li>
+    <li><strong>Diagnostic logs</strong> from AHDS DICOM service, Container Apps, Service Bus, and the storage account &rarr; same Log Analytics workspace Foundry already created at hub time. Wire a Sentinel data connector if your security team requires SIEM.</li>
+  </ul>
+
+  <h2>Common pitfalls</h2>
+  <ul>
+    <li><strong>Compressed transfer syntaxes.</strong> Modalities often send JPEG 2000 (<code>1.2.840.10008.1.2.4.91</code>) or JPEG-LS. <code>pydicom.pixel_array</code> needs the <code>pylibjpeg</code> family installed for the worker to decode. The listener doesn't decode &mdash; it just lands bytes &mdash; so the failure mode shows up in the worker, not the listener.</li>
+    <li><strong>Burst arrivals.</strong> A radiology shift change can queue thousands of studies in minutes. Set Service Bus throughput to handle the peak (the Standard SKU scales automatically up to its messaging units cap; jump to Premium if you're sustained-saturated).</li>
+    <li><strong>Idempotency.</strong> The PACS will sometimes re-send a study if its ack fails. Our blob path is <code>{study}/{series}/{sop}.dcm</code> and we use <code>overwrite=False</code> &mdash; second send returns 409 from blob, the listener logs and acks, no duplicate worker invocation. Don't change this without a plan.</li>
+    <li><strong>Container Apps TCP ingress quirks.</strong> Each TCP-ingress app needs its own <code>--exposed-port</code> in the env, and you can only have a small number of TCP apps per environment. Plan if you need multiple listeners.</li>
+    <li><strong>Verification (echo) is your friend.</strong> Always expose Verification SCP on the DIMSE listener. PACS admins use <code>echoscu</code> for cabling sanity-checks &mdash; if you reject Verification they assume the listener is broken.</li>
+    <li><strong>Time to first study in prod.</strong> Even with a perfect listener, getting Vue PACS routing-rule changes through a hospital's change control board typically dominates the calendar. Start that ticket on day one.</li>
+  </ul>
+
+  <h2>What composes with the rest of the guide</h2>
+  <ul>
+    <li><a href="#tab=architecture">Architecture</a> &mdash; the listener + Service Bus pair slots in front of the existing Foundry / AML / blob pipeline; nothing downstream changes.</li>
+    <li><a href="#tab=dicom">DICOM Ingestion</a> &mdash; the format the worker uses to encode the DICOM into the endpoint's expected base64-PNG payload. Listener &rarr; blob &rarr; worker uses that same encoding step.</li>
+    <li><a href="#tab=networking">Networking &amp; Security</a> &mdash; private endpoints, ExpressRoute, customer-managed keys; everything above plugs into that subnet design.</li>
+    <li><a href="#tab=ops">Monitoring &amp; Ops</a> &mdash; queue depth, DLQ count, and AE Title acceptance rate are the listener's three SLI signals to alert on.</li>
+  </ul>
+
+  <h2>Quick links</h2>
+  <ul>
+    <li><a href="assets/samples/dimse_listener.py" target="_blank" rel="noopener"><code>assets/samples/dimse_listener.py</code></a> &mdash; pynetdicom C-STORE SCP (Option 2)</li>
+    <li><a href="assets/samples/stow_listener.py" target="_blank" rel="noopener"><code>assets/samples/stow_listener.py</code></a> &mdash; FastAPI STOW-RS (Option 3)</li>
+    <li><a href="assets/samples/sb_worker.py" target="_blank" rel="noopener"><code>assets/samples/sb_worker.py</code></a> &mdash; Service Bus consumer that invokes CxrReportGen</li>
+    <li><a href="assets/samples/listener.Dockerfile" target="_blank" rel="noopener"><code>assets/samples/listener.Dockerfile</code></a> &mdash; container image for the DIMSE listener</li>
+    <li><a href="https://learn.microsoft.com/en-us/azure/healthcare-apis/dicom/dicom-services-conformance-statement-v2" target="_blank" rel="noopener">AHDS DICOM service conformance</a> (STOW-RS / WADO-RS / QIDO-RS)</li>
+    <li><a href="https://learn.microsoft.com/en-us/azure/container-apps/tcp-app-listener-introduction" target="_blank" rel="noopener">Container Apps TCP ingress</a> &mdash; how the DIMSE listener gets a TCP port</li>
+    <li><a href="https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions" target="_blank" rel="noopener">Service Bus message sessions</a> &mdash; the per-study grouping primitive</li>
+    <li><a href="https://keda.sh/docs/2.13/scalers/azure-service-bus/" target="_blank" rel="noopener">KEDA Azure Service Bus scaler</a> &mdash; how the worker scales on queue depth</li>
   </ul>
 </section>
 
