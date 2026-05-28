@@ -71,7 +71,7 @@
 
   <h2>What you'll do</h2>
   <ol>
-    <li>Stand up an Azure Machine Learning workspace (or a Microsoft Foundry project).</li>
+    <li>Stand up a <strong>Microsoft Foundry hub + project</strong> (the recommended container for healthcare-AI deployments; a plain Azure ML workspace also works since Foundry projects are AML workspaces under the hood).</li>
     <li>Request quota for the <code>Standard_NC24ads_A100_v4</code> SKU.</li>
     <li>Resolve the <code>CxrReportGen</code> model from the AzureML system registry.</li>
     <li>Deploy it to a Managed Online Endpoint (A100 80GB).</li>
@@ -83,7 +83,7 @@
   <table>
     <thead><tr><th>Aspect</th><th>Detail</th></tr></thead>
     <tbody>
-      <tr><td>Registry</td><td><code>registry_name="azureml"</code> · model <code>CxrReportGen</code> · label <code>latest</code></td></tr>
+      <tr><td>Registry</td><td><strong>Microsoft Foundry model catalog</strong> (system registry <code>azureml</code>) · model <code>CxrReportGen</code> · label <code>latest</code>. Browse at <a href="https://ai.azure.com" target="_blank" rel="noopener">ai.azure.com</a> → Models → "Microsoft Healthcare AI" filter.</td></tr>
       <tr><td>Architecture</td><td>BiomedCLIP (image encoder) + Phi-3-mini-4k-instruct (text encoder)</td></tr>
       <tr><td>Required SKU</td><td><code>Standard_NC24ads_A100_v4</code> (1× A100 80GB · 24 vCPU · 220 GiB)</td></tr>
       <tr><td>Auth</td><td>Key or AAD token on the Managed Online Endpoint</td></tr>
@@ -120,10 +120,10 @@ ml.online_deployments.begin_create_or_update(ManagedOnlineDeployment(
 <!-- =================== End-to-End Walkthrough =================== -->
 <section class="tab-panel" id="tab-walkthrough" role="tabpanel" aria-labelledby="tabbtn-walkthrough" tabindex="-1">
   <h1>End-to-End Walkthrough — from empty subscription to rendered report</h1>
-  <p class="lede">Sixteen sequential steps. Total active work ~1 hour, plus 20–40 min wait for the deployment to roll out. Expected one-time cost: <strong>under $10</strong> if you delete the endpoint at the end (one A100 hour ≈ $3.67 + ~$2 in workspace dependencies).</p>
+  <p class="lede">Seventeen sequential steps. Total active work ~1 hour, plus 20–40 min wait for the deployment to roll out. Expected one-time cost: <strong>under $10</strong> if you delete the endpoint at the end (one A100 hour ≈ $3.67 + ~$2 in Foundry hub dependencies + pennies for blob storage).</p>
 
   <div class="callout callout--info">
-    <strong>What you'll have at the end.</strong> A live managed online endpoint serving CXRReportGen, a Python environment that can feed it real DICOM files, and a structured radiology report (JSON + Markdown + overlay PNG) generated from your own chest X-ray study.
+    <strong>What you'll have at the end.</strong> A live <a href="https://ai.azure.com" target="_blank" rel="noopener">Microsoft Foundry</a> project hosting the CxrReportGen model on a managed online endpoint, a locked-down Blob Storage account that ingests DICOM studies and stores generated reports, and a Python script that turns each new study into a structured radiology report (JSON + Markdown + overlay PNG) written back to blob.
   </div>
 
   <h2>The journey at a glance</h2>
@@ -132,43 +132,58 @@ ml.online_deployments.begin_create_or_update(ManagedOnlineDeployment(
   participant U as You (laptop)
   participant CLI as az / Python
   participant ARM as Azure Resource Manager
-  participant W as AML Workspace + deps
-  participant R as azureml system registry
+  participant F as Foundry hub + project
+  participant SA as Blob Storage (dicom-input / cxr-reports)
+  participant R as Foundry model catalog (azureml registry)
   participant EP as Managed Online Endpoint (A100)
   U->>CLI: az login + set subscription
   U->>ARM: az group create
   U->>ARM: check / request A100 quota
-  ARM->>W: az ml workspace create (storage, KV, ACR, App Insights)
+  ARM->>F: create hub (--kind hub) + project (--kind project)
+  ARM->>SA: create storage + containers + role assignment to project MI
   U->>R: MLClient(registry_name="azureml").models.get("CxrReportGen")
   U->>EP: create endpoint + deployment (A100, 1 instance)
   Note over EP: 20–40 min provisioning
+  SA->>U: download frontal.dcm + lateral.dcm
   U->>EP: invoke (toolkit passes .dcm directly)
   EP-->>U: findings + bounding boxes
-  U->>U: render report (Markdown + overlay PNG)
+  U->>SA: upload report.json + report.md + overlay PNG
 </code></pre>
 
   <h2>Step 0 — Decide on names + region <span class="muted">(5 min)</span></h2>
   <p>Pick a region where both the A100 v4 SKU and the model are available — East US, East US 2, West US 3, or Sweden Central are safe defaults. See the <a href="#tab=prereqs">Prerequisites tab</a> for the full region matrix.</p>
-<pre><code class="language-bash"># Export these and reuse for the rest of the walkthrough
+<pre><code class="language-bash"># Export these once and reuse for the rest of the walkthrough
 export SUB="00000000-0000-0000-0000-000000000000"   # your subscription id
 export LOC="eastus"
 export RG="cxr-rg"
-export WS="cxr-mlw"
+
+# Microsoft Foundry topology: a hub holds the shared infra, projects sit under it
+export HUB="cxr-foundry-hub"
+export PROJ="cxr-foundry-proj"
+
+# Storage account for DICOM input + report output (must be globally unique, 3-24 lowercase)
+export SA="cxrdicom$RANDOM"
+export IN_CONTAINER="dicom-input"
+export OUT_CONTAINER="cxr-reports"
+
+# Endpoint + deployment names
 export EP="cxr-endpoint-001"
 export DEP="cxr-v1"
 </code></pre>
 
   <h2>Step 1 — Install tooling <span class="muted">(10 min)</span></h2>
-<pre><code class="language-bash"># Azure CLI + ML extension
+<pre><code class="language-bash"># Azure CLI + ML extension (covers both AML and Microsoft Foundry)
 brew install azure-cli            # macOS — or use the MS installer on Win/Linux
 az extension add -n ml --upgrade
 
 # Python 3.10+ in a fresh venv
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv &amp;&amp; source .venv/bin/activate
 pip install --upgrade pip
-pip install azure-ai-ml azure-identity pydicom pillow matplotlib numpy
+pip install azure-ai-ml azure-ai-projects azure-identity azure-storage-blob \
+            pydicom pillow matplotlib numpy
 pip install "healthcareai_toolkit @ git+https://github.com/microsoft/healthcareai-examples.git#subdirectory=package"
 </code></pre>
+  <p>Why <code>azure-ai-projects</code>? It's the Foundry-native Python SDK — gives you <code>AIProjectClient</code> for browsing the project's model catalog, managing connections (including the blob storage you'll attach below), running evaluations, and reading tracing data. <code>azure-ai-ml</code> is still what creates the endpoint itself.</p>
 
   <h2>Step 2 — Sign in + select subscription <span class="muted">(2 min)</span></h2>
 <pre><code class="language-bash">az login                 # interactive browser flow
@@ -188,29 +203,72 @@ az account show --query "{name:name, id:id, tenantId:tenantId}" -o table
 #   Provider: Machine Learning &rarr; Family: StandardNCADSA100v4Family &rarr; Region: $LOC
 </code></pre>
 
-  <h2>Step 5 — Create the Azure ML workspace <span class="muted">(3–5 min)</span></h2>
-  <p>One command creates the workspace and auto-provisions a storage account, Key Vault, App Insights, and (on first deployment) an Azure Container Registry.</p>
-<pre><code class="language-bash">az ml workspace create -g "$RG" -n "$WS" -l "$LOC"
+  <h2>Step 5 — Create the Microsoft Foundry hub + project <span class="muted">(5–7 min)</span></h2>
+  <p>Foundry topology in one diagram: the <strong>hub</strong> owns shared infrastructure (storage account, Key Vault, App Insights, Container Registry, connections); <strong>projects</strong> sit underneath and are where you deploy models. A project IS an AML workspace at the API level — so everything the AML SDK / <code>az ml</code> can do still works.</p>
+<pre><code class="language-bash"># 1) Hub = shared infra. Auto-creates storage, KV, App Insights.
+az ml workspace create --kind hub -g "$RG" -l "$LOC" -n "$HUB"
 
-# Drop a config.json next to your notebooks so MLClient.from_config() works:
+# 2) Project = your workspace, scoped under that hub
+HUB_ID=$(az ml workspace show -g "$RG" -n "$HUB" --query id -o tsv)
+az ml workspace create --kind project -g "$RG" -l "$LOC" -n "$PROJ" --hub-id "$HUB_ID"
+
+# 3) Drop config.json pointing at the PROJECT (not the hub) so MLClient.from_config() works
 cat &gt; config.json &lt;&lt;EOF
 {
   "subscription_id": "$SUB",
   "resource_group": "$RG",
-  "workspace_name": "$WS"
+  "workspace_name": "$PROJ"
 }
 EOF
 </code></pre>
   <div class="callout callout--info">
-    Prefer <strong>Microsoft Foundry</strong>? Pass <code>--kind hub</code> and create a project under it. The remaining steps are identical — the <code>azureml</code> system registry and the <code>CxrReportGen</code> model are the same. See the <a href="#tab=deploy">Deploy tab → azd path</a> for a fully IaC variant.
+    <strong>Open it in the Foundry portal.</strong> Browse to <a href="https://ai.azure.com" target="_blank" rel="noopener">ai.azure.com</a>, switch to your tenant, and you'll see <code>$PROJ</code> listed under <code>$HUB</code>. The Model catalog tab is where <code>CxrReportGen</code> shows up — same artifact you'll resolve via the SDK in Step 6.
   </div>
+  <p>Prefer the older single-workspace model? Replace this step with <code>az ml workspace create -g "$RG" -n cxr-mlw -l "$LOC"</code> and point <code>workspace_name</code> at <code>cxr-mlw</code>. Every other step in this walkthrough is identical.</p>
 
-  <h2>Step 6 — Resolve the model from the system registry <span class="muted">(10 s)</span></h2>
+  <h2>Step 5b — Create Blob Storage for DICOM input + report output <span class="muted">(3 min)</span></h2>
+  <p>The Foundry hub already auto-created a workspace storage account for model artifacts. Don't reuse it for PHI — create a dedicated, locked-down account for the DICOM pipeline so you can apply tighter access policies, lifecycle rules, and audit boundaries.</p>
+<pre><code class="language-bash"># 1) Dedicated storage account — TLS 1.2, no public blob access, HTTPS only
+az storage account create -g "$RG" -l "$LOC" -n "$SA" \
+  --sku Standard_LRS --kind StorageV2 \
+  --min-tls-version TLS1_2 \
+  --allow-blob-public-access false \
+  --https-only true
+
+# 2) Two containers: one for incoming DICOM studies, one for finished reports
+SA_KEY=$(az storage account keys list -g "$RG" -n "$SA" --query "[0].value" -o tsv)
+az storage container create -n "$IN_CONTAINER"  --account-name "$SA" --account-key "$SA_KEY"
+az storage container create -n "$OUT_CONTAINER" --account-name "$SA" --account-key "$SA_KEY"
+
+# 3) Upload a study from local disk → dicom-input/study-001/{frontal,lateral}.dcm
+az storage blob upload-batch -s ./my_study -d "$IN_CONTAINER/study-001" \
+  --account-name "$SA" --account-key "$SA_KEY" --pattern "*.dcm"
+
+# 4) (Recommended) Attach the storage account to the Foundry PROJECT as a Connection
+#    so the endpoint + notebooks can use Managed Identity instead of a key.
+az ml connection create --type azure_blob \
+  -g "$RG" --workspace-name "$PROJ" -n cxr-dicom-storage \
+  --target "https://${SA}.blob.core.windows.net/${IN_CONTAINER}" \
+  --credentials type=managed_identity
+
+# 5) Grant the project's managed identity Storage Blob Data Contributor on the SA
+MI=$(az ml workspace show -g "$RG" -n "$PROJ" --query identity.principal_id -o tsv)
+SA_ID=$(az storage account show -g "$RG" -n "$SA" --query id -o tsv)
+az role assignment create --assignee "$MI" \
+  --role "Storage Blob Data Contributor" --scope "$SA_ID"
+</code></pre>
+  <div class="callout callout--warn">
+    <strong>Encryption + lifecycle.</strong> For PHI workloads also: enable customer-managed keys (CMK) on the storage account, turn on soft delete (7+ days), enable versioning, and add a lifecycle rule that moves <code>dicom-input</code> blobs to Cool tier after 30 days and to Archive after 180. The <a href="#tab=cost-calculator">Cost Calculator</a> models these tier transitions.
+  </div>
+  <p>For high-volume PACS ingestion you'd usually layer the <strong>Azure Health Data Services DICOM service</strong> on top (DICOMweb STOW-RS endpoint, OHIF viewer compatibility, native DICOM tag de-id) — see the <a href="#tab=dicom">DICOM Ingestion tab</a>.</p>
+
+  <h2>Step 6 — Resolve the model from the Foundry catalog <span class="muted">(10 s)</span></h2>
+  <p>The same model the Foundry portal shows under "Microsoft Healthcare AI" lives in the <code>azureml</code> system registry. Either resolve it via the AML SDK (below) or browse and click "Deploy" inside <a href="https://ai.azure.com" target="_blank" rel="noopener">ai.azure.com</a> → your project → Model catalog → search "CxrReportGen".</p>
 <pre><code class="language-python">from azure.ai.ml import MLClient
 from azure.identity import DefaultAzureCredential
 
 cred = DefaultAzureCredential()
-registry = MLClient(cred, registry_name="azureml")
+registry = MLClient(cred, registry_name="azureml")   # this IS the Foundry catalog
 model = registry.models.get(name="CxrReportGen", label="latest")
 print(f"{model.name}  version={model.version}  id={model.id}")
 </code></pre>
@@ -281,6 +339,8 @@ for finding, boxes in result[0]["output"]:
 
   <h2>Step 12 — Run inference on your own DICOM <span class="muted">(varies)</span></h2>
   <p>The toolkit accepts <code>.dcm</code> directly. It reads the pixel data via SimpleITK, applies 1st/99th-percentile windowing, converts to uint8, encodes a PNG, and base64-encodes the payload — see the <a href="#tab=dicom">DICOM Ingestion tab</a> for the full source-level walkthrough.</p>
+
+  <h3>12a — From local disk</h3>
 <pre><code class="language-python">from healthcareai_toolkit.clients import CxrReportGenClient
 
 client = CxrReportGenClient(endpoint_name="cxr-endpoint-001")
@@ -296,6 +356,51 @@ result = client.submit(
 )
 findings = result[0]["output"]
 </code></pre>
+
+  <h3>12b — From Blob Storage (production pattern)</h3>
+  <p>Pull DICOMs straight out of the <code>$IN_CONTAINER</code> container you created in Step 5b. Uses <code>DefaultAzureCredential</code> + the role assignment from Step 5b — no SAS tokens, no keys baked into code. Writes <code>report.json</code> + <code>report.md</code> + the overlay PNG back into <code>$OUT_CONTAINER</code>.</p>
+<pre><code class="language-bash"># Full script (download → invoke → render → upload):
+python blob_inference.py \
+  --account "$SA" --input-container "$IN_CONTAINER" --output-container "$OUT_CONTAINER" \
+  --study-id study-001 \
+  --endpoint "$EP" \
+  --indication "65F, shortness of breath x 3 days" \
+  --technique "PA and lateral chest radiograph"
+</code></pre>
+<pre><code class="language-python"># Core of blob_inference.py — full source: assets/samples/blob_inference.py
+import io, json, pathlib, tempfile
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient
+from healthcareai_toolkit.clients import CxrReportGenClient
+
+ACCOUNT, IN_CONT, OUT_CONT, STUDY = "cxrdicom001", "dicom-input", "cxr-reports", "study-001"
+
+cred = DefaultAzureCredential()
+svc = BlobServiceClient(f"https://{ACCOUNT}.blob.core.windows.net", credential=cred)
+inp = svc.get_container_client(IN_CONT)
+out = svc.get_container_client(OUT_CONT)
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = pathlib.Path(tmp)
+    for name in ("frontal.dcm", "lateral.dcm"):
+        (tmp / name).write_bytes(inp.get_blob_client(f"{STUDY}/{name}").download_blob().readall())
+
+    client = CxrReportGenClient(endpoint_name="cxr-endpoint-001")
+    result = client.submit(
+        frontal_image=str(tmp / "frontal.dcm"),
+        lateral_image=str(tmp / "lateral.dcm"),
+        indication="65F, shortness of breath x 3 days",
+        technique="PA and lateral chest radiograph",
+        comparison="None",
+    )
+    findings = result[0]["output"]
+    out.upload_blob(f"{STUDY}/findings.json", json.dumps(findings).encode(), overwrite=True)
+</code></pre>
+  <p>Full script: <a href="assets/samples/blob_inference.py">blob_inference.py</a> — handles arbitrary study IDs, optional priors, automatic <code>make_report.py</code> rendering, and uploads <code>report.json</code> / <code>report.md</code> / <code>frontal_overlay.png</code> back to the output container.</p>
+
+  <div class="callout callout--info">
+    <strong>Automate it.</strong> Wire <strong>Event Grid</strong> on <code>$IN_CONTAINER</code> with a <code>Microsoft.Storage.BlobCreated</code> filter; route to an Azure Function (or Container Apps job) that calls <code>blob_inference.py</code> per new study. The function's managed identity inherits the same role assignment from Step 5b. See <a href="#tab=dicom">DICOM Ingestion → Ingestion patterns</a>.
+  </div>
 
   <h2>Step 13 — Render the final report <span class="muted">(2 min)</span></h2>
   <p>Pull together the three deliverables a radiology workflow expects: a structured JSON record, a Markdown-rendered report, and an overlay PNG with the bounding boxes drawn back in <em>original DICOM pixel space</em>.</p>
@@ -369,10 +474,13 @@ findings = result[0]["output"]
   </ul>
 
   <h2>Step 16 — Clean up <span class="muted">(30 s — do this when you're done experimenting!)</span></h2>
-<pre><code class="language-bash"># Stop the meter on the A100 (workspace + storage stay)
+<pre><code class="language-bash"># Stop the A100 meter (project + storage stay)
 az ml online-endpoint delete -n "$EP" -y
 
-# Or nuke everything in the resource group
+# Or nuke the project but keep the hub (faster re-deploy later)
+az ml workspace delete -g "$RG" -n "$PROJ" -y --permanently-delete
+
+# Or burn everything to the ground — hub, project, storage, App Insights, KV, ACR
 az group delete -n "$RG" -y --no-wait
 </code></pre>
 
@@ -1119,14 +1227,26 @@ az monitor autoscale rule create -g RG --autoscale-name cxr-autoscale \
 
   <h2>Microsoft Learn</h2>
   <ul>
+    <li><a href="https://learn.microsoft.com/azure/ai-foundry/what-is-azure-ai-foundry">What is Microsoft Foundry?</a></li>
+    <li><a href="https://learn.microsoft.com/azure/ai-foundry/how-to/create-projects">Foundry — create a hub + project</a></li>
+    <li><a href="https://learn.microsoft.com/azure/ai-foundry/how-to/connections-add">Foundry — add a Connection (blob, OpenAI, key vault, …)</a></li>
+    <li><a href="https://learn.microsoft.com/python/api/overview/azure/ai-projects-readme"><code>azure-ai-projects</code> SDK reference</a></li>
     <li><a href="https://learn.microsoft.com/azure/developer/azure-developer-cli/azure-ai-ml-endpoints">azd: Deploy to a Microsoft Foundry or Azure ML online endpoint</a></li>
     <li><a href="https://learn.microsoft.com/azure/machine-learning/how-to-deploy-online-endpoints">Deploy and score a model with an online endpoint</a></li>
     <li><a href="https://learn.microsoft.com/azure/machine-learning/concept-endpoints-online">Concept: online endpoints</a></li>
     <li><a href="https://learn.microsoft.com/azure/machine-learning/how-to-manage-quotas">Manage quotas (including +20% upgrade reservation)</a></li>
     <li><a href="https://learn.microsoft.com/azure/machine-learning/how-to-secure-online-endpoint">Secure online endpoints with managed VNet</a></li>
+    <li><a href="https://learn.microsoft.com/azure/storage/blobs/storage-blobs-introduction">Azure Blob Storage — overview</a></li>
+    <li><a href="https://learn.microsoft.com/python/api/overview/azure/storage-blob-readme">azure-storage-blob (Python) reference</a></li>
+    <li><a href="https://learn.microsoft.com/azure/event-grid/event-schema-blob-storage">Event Grid — Blob Storage event schema (BlobCreated)</a></li>
     <li><a href="https://learn.microsoft.com/azure/healthcare-apis/dicom/dicom-services-overview">Azure Health Data Services — DICOM service</a></li>
     <li><a href="https://learn.microsoft.com/azure/healthcare-apis/deidentification/overview">Azure Health Data Services — De-identification service</a></li>
     <li><a href="https://azure.microsoft.com/pricing/calculator/">Official Azure Pricing Calculator</a></li>
+  </ul>
+
+  <h2>Microsoft Foundry portal</h2>
+  <ul>
+    <li><a href="https://ai.azure.com">ai.azure.com — Foundry portal (hub, projects, model catalog, connections)</a></li>
   </ul>
 
   <h2>Microsoft GitHub</h2>
