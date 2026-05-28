@@ -206,7 +206,7 @@ az account show --query "{name:name, id:id, tenantId:tenantId}" -o table
 </code></pre>
 
   <h2>Step 5 — Create the Microsoft Foundry hub + project <span class="muted">(5–7 min)</span></h2>
-  <p>Foundry topology in one diagram: the <strong>hub</strong> owns shared infrastructure (storage account, Key Vault, App Insights, Container Registry, connections); <strong>projects</strong> sit underneath and are where you deploy models. A project IS an AML workspace at the API level — so everything the AML SDK / <code>az ml</code> can do still works.</p>
+  <p>Foundry topology in one diagram: the <strong>hub</strong> owns shared infrastructure (workspace storage account, Key Vault, Application Insights + Log Analytics, and &mdash; on first deployment &mdash; an Azure Container Registry plus any Foundry Connections you add); <strong>projects</strong> sit underneath and are where you deploy models. A project IS an AML workspace at the API level &mdash; so everything the AML SDK / <code>az ml</code> can do still works.</p>
 <pre><code class="language-bash"># 1) Hub = shared infra. Auto-creates storage, KV, App Insights.
 az ml workspace create --kind hub -g "$RG" -l "$LOC" -n "$HUB"
 
@@ -525,17 +525,24 @@ bash deploy_cxrreportgen_end_to_end.sh
          project  = where your endpoint actually lives. CxrReportGen deployment  
                     attaches to the project.  
   
-       '--kind hub' auto-provisions a workspace storage account, Key Vault, and  
-       App Insights in this RG. First create takes 3-5 min.  
- Foundry hub:     cxr-foundry-hub  
- Hub resource id: /subscriptions/.../resourceGroups/cxr-rg/providers/...  
-       Auto-provisioned dependencies now live in cxr-rg:  
+       '--kind hub' auto-provisions a full dependency stack inside this RG:
+         - workspace storage account     (model artifacts, run logs)
+         - Azure Key Vault               (endpoint keys, connection secrets)
+         - Application Insights          (request traces, custom metrics)
+         - Log Analytics workspace       (backing store for App Insights)
+       Azure Container Registry (which holds the CxrReportGen model image) is
+       auto-created on the first deployment (Step 16) unless you pre-attach an
+       existing one with --container-registry. First hub create takes 3-5 min.
+ Foundry hub:     cxr-foundry-hub
+ Hub resource id: /subscriptions/.../resourceGroups/cxr-rg/providers/...
+       Auto-provisioned dependencies now live in cxr-rg:
     Name                            Type
     ------------------------------  -----------------------------------------
     cxrfoundryhub                   Microsoft.MachineLearningServices/workspaces
     cxrfoundryhubkv...              Microsoft.KeyVault/vaults
     cxrfoundryhubst...              Microsoft.Storage/storageAccounts
     cxrfoundryhubin...              Microsoft.Insights/components
+    cxrfoundryhubla...              Microsoft.OperationalInsights/workspaces
 </code></pre>
 
   <h2>22 steps at a glance</h2>
@@ -549,7 +556,7 @@ bash deploy_cxrreportgen_end_to_end.sh
       <tr><td>4</td><td>Resource Providers</td><td>Register MachineLearningServices, Storage, KeyVault, ContainerRegistry, Insights, Authorization, Network, etc.</td><td><a href="#tab=prereqs">Prerequisites</a></td></tr>
       <tr><td>5</td><td>Resource Group</td><td><code>az group create</code> &mdash; single boundary for cleanup.</td><td><a href="#tab=walkthrough">Step 4</a></td></tr>
       <tr><td>6</td><td>A100 quota</td><td>Query <code>NCADSA100v4</code> family usage in the chosen region; warn if &lt; 24 vCPUs.</td><td><a href="#tab=prereqs">Prerequisites</a></td></tr>
-      <tr><td>7</td><td>Foundry HUB</td><td><code>az ml workspace create --kind hub</code> &mdash; auto-provisions storage, KV, App Insights, ACR.</td><td><a href="#tab=walkthrough">Step 5</a></td></tr>
+      <tr><td>7</td><td>Foundry HUB</td><td><code>az ml workspace create --kind hub</code> &mdash; auto-provisions Storage, Key Vault, Application Insights + Log Analytics. ACR appears on first deployment.</td><td><a href="#tab=walkthrough">Step 5</a></td></tr>
       <tr><td>8</td><td>Foundry PROJECT</td><td><code>--kind project</code> linked to the hub; drops <code>config.json</code> for <code>MLClient.from_config()</code>.</td><td><a href="#tab=walkthrough">Step 5</a></td></tr>
       <tr><td>9</td><td>Storage Account</td><td>Dedicated locked-down <code>StorageV2</code> account for DICOMs (TLS1.2, no public blob, HTTPS only).</td><td><a href="#tab=walkthrough">Step 5b</a></td></tr>
       <tr><td>10</td><td>Containers</td><td><code>dicom-input</code> + <code>cxr-reports</code>.</td><td><a href="#tab=walkthrough">Step 5b</a></td></tr>
@@ -567,6 +574,116 @@ bash deploy_cxrreportgen_end_to_end.sh
       <tr><td>22</td><td>Summary + cleanup</td><td>Print Foundry portal link, endpoint URL, blob URL, and the cleanup command.</td><td><a href="#tab=walkthrough">Step 16</a></td></tr>
     </tbody>
   </table>
+
+  <h2>Auto-provisioned dependencies (the full Azure footprint)</h2>
+  <p>The script intentionally relies on Azure&rsquo;s built-in auto-provisioning so you don&rsquo;t need to wire up dependencies by hand. Here is exactly what lands in your resource group by the end of Step 22, who creates each component, and what it is for:</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Component</th>
+        <th>Azure resource type</th>
+        <th>Created by</th>
+        <th>Step</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Foundry Hub</td>
+        <td><code>Microsoft.MachineLearningServices/workspaces</code> (kind=Hub)</td>
+        <td>You &mdash; <code>az ml workspace create --kind hub</code></td>
+        <td>7</td>
+        <td>Shared infra root for the project: holds connections, RBAC, and the auto-provisioned dependency stack below.</td>
+      </tr>
+      <tr>
+        <td>Foundry Project</td>
+        <td><code>Microsoft.MachineLearningServices/workspaces</code> (kind=Project)</td>
+        <td>You &mdash; <code>az ml workspace create --kind project --hub-id</code></td>
+        <td>8</td>
+        <td>Where the endpoint actually lives. A project IS an AML workspace, so the AML SDK and <code>az ml</code> work against it unchanged.</td>
+      </tr>
+      <tr>
+        <td>Workspace Storage Account</td>
+        <td><code>Microsoft.Storage/storageAccounts</code></td>
+        <td>Hub auto-provision</td>
+        <td>7</td>
+        <td>Holds model artifacts, run logs, snapshots, and prompt-flow data. Separate from the dedicated DICOM storage account you create in Step 9.</td>
+      </tr>
+      <tr>
+        <td>Azure Key Vault</td>
+        <td><code>Microsoft.KeyVault/vaults</code></td>
+        <td>Hub auto-provision</td>
+        <td>7</td>
+        <td>Stores endpoint primary/secondary keys, the storage-account connection string, and any other secrets the workspace needs.</td>
+      </tr>
+      <tr>
+        <td>Application Insights</td>
+        <td><code>Microsoft.Insights/components</code></td>
+        <td>Hub auto-provision</td>
+        <td>7</td>
+        <td>Telemetry sink for the endpoint: request rate, latency percentiles, failures, custom metrics, server-side traces.</td>
+      </tr>
+      <tr>
+        <td>Log Analytics Workspace</td>
+        <td><code>Microsoft.OperationalInsights/workspaces</code></td>
+        <td>Hub auto-provision (workspace-based App Insights requires it)</td>
+        <td>7</td>
+        <td>Backing store for App Insights data. Lets you write KQL against endpoint logs and configure Azure Monitor alerts.</td>
+      </tr>
+      <tr>
+        <td>Azure Container Registry</td>
+        <td><code>Microsoft.ContainerRegistry/registries</code></td>
+        <td>AML auto-creates on first deployment (or pre-attach with <code>--container-registry</code>)</td>
+        <td>16</td>
+        <td>Hosts the CxrReportGen serving container image (~15&nbsp;GB). Subsequent deployments to this hub/project re-use the same ACR.</td>
+      </tr>
+      <tr>
+        <td>DICOM Storage Account</td>
+        <td><code>Microsoft.Storage/storageAccounts</code> (StorageV2, TLS1.2, HTTPS only, no public blob)</td>
+        <td>You &mdash; <code>az storage account create</code></td>
+        <td>9</td>
+        <td>Dedicated locked-down account separate from the workspace storage. Holds the <code>dicom-input</code> and <code>cxr-reports</code> containers.</td>
+      </tr>
+      <tr>
+        <td>Blob Containers</td>
+        <td>blobs inside the DICOM storage account</td>
+        <td>You &mdash; <code>az storage container create</code></td>
+        <td>10</td>
+        <td><code>dicom-input</code> (uploaded studies) and <code>cxr-reports</code> (generated JSON/Markdown/PNG overlays).</td>
+      </tr>
+      <tr>
+        <td>RBAC Role Assignments</td>
+        <td><code>Microsoft.Authorization/roleAssignments</code></td>
+        <td>You &mdash; <code>az role assignment create</code></td>
+        <td>11</td>
+        <td><em>Storage Blob Data Contributor</em> granted to (a) the project&rsquo;s managed identity and (b) the operator running the script.</td>
+      </tr>
+      <tr>
+        <td>Foundry Connection</td>
+        <td><code>azure_blob</code> connection on the project</td>
+        <td>You &mdash; <code>az ml connection create --type azure_blob</code></td>
+        <td>12</td>
+        <td>Wires the DICOM container into the project with <code>type=managed_identity</code> auth &mdash; no keys on disk.</td>
+      </tr>
+      <tr>
+        <td>Managed Online Endpoint</td>
+        <td><code>Microsoft.MachineLearningServices/workspaces/onlineEndpoints</code></td>
+        <td>You via SDK</td>
+        <td>15</td>
+        <td>DNS-addressable scoring URI with key auth. No compute attached yet &mdash; this is just the shell.</td>
+      </tr>
+      <tr>
+        <td>Online Deployment</td>
+        <td><code>Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments</code> on <code>Standard_NC24ads_A100_v4</code></td>
+        <td>You via SDK</td>
+        <td>16</td>
+        <td>The actual A100 80&nbsp;GB worker. Pulls the model image from ACR, mounts the model files, and routes 100% traffic.</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout callout--ok">
+    <strong>What this means for billing.</strong> Of those 13 components, only the <strong>Online Deployment</strong> (the A100 VM) is a meaningful meter. Storage, Key Vault, ACR, App Insights, and Log Analytics combined are pennies per day at this scale. See the <a href="#tab=cost">Cost</a> tab for an itemised breakdown.
+  </div>
 
   <h2>Environment variables you can override</h2>
   <table>
@@ -749,8 +866,14 @@ note &quot;             connections, RBAC root). One hub per team is typical.&qu
 note &quot;  project  = where your endpoint actually lives. CxrReportGen deployment&quot;
 note &quot;             attaches to the project.&quot;
 note &quot;&quot;
-note &quot;&#x27;--kind hub&#x27; auto-provisions a workspace storage account, Key Vault, and&quot;
-note &quot;App Insights in this RG. First create takes 3-5 min.&quot;
+note &quot;&#x27;--kind hub&#x27; auto-provisions a full dependency stack inside this RG:&quot;
+note &quot;  - workspace storage account     (model artifacts, run logs)&quot;
+note &quot;  - Azure Key Vault               (endpoint keys, connection secrets)&quot;
+note &quot;  - Application Insights          (request traces, custom metrics)&quot;
+note &quot;  - Log Analytics workspace       (backing store for App Insights)&quot;
+note &quot;Azure Container Registry (which holds the CxrReportGen model image) is&quot;
+note &quot;auto-created on the first deployment (Step 16) unless you pre-attach an&quot;
+note &quot;existing one with --container-registry. First hub create takes 3-5 min.&quot;
 if az ml workspace show -g &quot;$RG&quot; -n &quot;$HUB&quot; &gt;/dev/null 2&gt;&amp;1; then
   warn &quot;Hub &#x27;$HUB&#x27; already exists — reusing.&quot;
 else
@@ -945,7 +1068,8 @@ step 16 &quot;Create A100 DEPLOYMENT  (~20-40 min — coffee break)&quot;
 # ============================================================================
 note &quot;This is the long one. The SDK call:&quot;
 note &quot;  1. tells the AML control plane to provision Standard_NC24ads_A100_v4&quot;
-note &quot;  2. pulls the CxrReportGen serving container (~15 GB) into a managed ACR&quot;
+note &quot;  2. pulls the CxrReportGen serving container (~15 GB) into a managed&quot;
+note &quot;     Azure Container Registry (auto-created in this RG on first deploy)&quot;
 note &quot;  3. mounts the model files, starts the worker, waits for /health to be 200&quot;
 note &quot;  4. routes 100% traffic to the new deployment&quot;
 note &quot;&quot;
