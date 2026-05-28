@@ -73,7 +73,7 @@
     <li>Request quota for the <code>Standard_NC24ads_A100_v4</code> SKU.</li>
     <li>Resolve the <code>CxrReportGen</code> model from the AzureML system registry.</li>
     <li>Deploy it to a Managed Online Endpoint (A100 80GB).</li>
-    <li>Convert DICOM → 8-bit PNG → base64 in your ingestion pipeline.</li>
+    <li>Feed DICOM images via the official <code>healthcareai_toolkit</code> client (which handles DICOM→PNG→base64 for you) or your own converter.</li>
     <li>Wire monitoring, private networking, and cost guardrails.</li>
   </ol>
 
@@ -85,7 +85,8 @@
       <tr><td>Architecture</td><td>BiomedCLIP (image encoder) + Phi-3-mini-4k-instruct (text encoder)</td></tr>
       <tr><td>Required SKU</td><td><code>Standard_NC24ads_A100_v4</code> (1× A100 80GB · 24 vCPU · 220 GiB)</td></tr>
       <tr><td>Auth</td><td>Key or AAD token on the Managed Online Endpoint</td></tr>
-      <tr><td>Inputs</td><td><code>frontal_image</code>, <code>lateral_image</code> (base64 JPG/PNG), <code>indication</code>, <code>technique</code>, <code>comparison</code></td></tr>
+      <tr><td>Inputs (wire)</td><td><code>frontal_image</code>, <code>lateral_image</code> (base64 JPG/PNG), <code>indication</code>, <code>technique</code>, <code>comparison</code></td></tr>
+      <tr><td>Inputs (via toolkit)</td><td>Pass <code>.dcm</code>, <code>.png</code>, or <code>.jpg</code> file paths directly to <code>CxrReportGenClient.submit(...)</code> — DICOM conversion runs client-side automatically.</td></tr>
       <tr><td>Outputs</td><td>List of <code>[finding, [[x_min,y_min,x_max,y_max], …]]</code> normalized to a center-cropped square</td></tr>
       <tr><td>Typical latency</td><td>2–6 s per study on 1× A100. Set <code>request_timeout_ms=90000</code>.</td></tr>
     </tbody>
@@ -221,18 +222,51 @@ curl -fsSL https://aka.ms/install-azd.sh | bash
 <!-- =================== DICOM =================== -->
 <section class="tab-panel" id="tab-dicom" role="tabpanel" aria-labelledby="tabbtn-dicom" tabindex="-1">
   <h1>DICOM Ingestion Pipeline</h1>
-  <p class="lede">CXRReportGen does <strong>not</strong> accept raw DICOM. You convert each frontal/lateral image to an 8-bit monochrome PNG and base64-encode it before posting.</p>
+  <p class="lede"><strong>Yes — you can feed CXRReportGen <code>.dcm</code> files directly</strong> when you use Microsoft's official <code>healthcareai_toolkit</code>. The toolkit reads the DICOM, normalizes the pixel data, and base64-encodes a PNG for you. The HTTP endpoint itself only accepts base64 PNG/JPG inside the JSON payload — the toolkit does the DICOM→PNG step client-side, invisibly.</p>
 
-  <h2>Conversion rules you must respect</h2>
+  <div class="callout callout-info">
+    <strong>Wire format vs. client API.</strong> The managed online endpoint never sees DICOM bytes. But the official toolkit <code>CxrReportGenClient</code> (<a href="https://github.com/microsoft/healthcareai-examples/blob/main/package/healthcareai_toolkit/clients/medimage/cxrreportgen.py" target="_blank" rel="noopener">source</a>) lets you pass a <code>.dcm</code> path and handles SimpleITK read, 1st/99th-percentile windowing, 8-bit conversion, PNG encode, and base64 — in one call. This is the recommended production path.
+  </div>
+
+  <h2>Path A — Use the official toolkit (recommended)</h2>
+  <p>Install the toolkit (Python 3.10+) and pass DICOM files directly:</p>
+<pre><code class="language-bash">pip install "healthcareai_toolkit @ git+https://github.com/microsoft/healthcareai-examples.git#subdirectory=package"</code></pre>
+<pre><code class="language-python">from healthcareai_toolkit.clients import CxrReportGenClient
+
+client = CxrReportGenClient(endpoint_name="CxrReportGen-xxxxx")  # or set CXRREPORTGEN_MODEL_ENDPOINT
+
+result = client.submit(
+    frontal_image="study/frontal.dcm",   # .dcm, .png, or .jpg — all work
+    lateral_image="study/lateral.dcm",
+    indication="65F, shortness of breath",
+    technique="PA and lateral",
+    comparison="None",
+    # Optional prior study for change detection:
+    # prior_image="prior/frontal.dcm",
+    # prior_report="Stable cardiomegaly. No effusion.",
+)
+print(result[0]["output"])  # [["finding text", [[x0,y0,x1,y1], ...]], ...]
+</code></pre>
+  <p>What the toolkit does for you (verified from the source code):</p>
+  <ul>
+    <li><code>ImageReader</code> detects <code>application/dicom</code> and routes to <code>read_dicom_to_array</code> via SimpleITK.</li>
+    <li><code>ImagePreprocessor</code> applies <code>{"percentiles": (0.01, 0.99)}</code> — the CXR-tuned default that handles the 12-/16-bit dynamic range without crushing soft-tissue detail.</li>
+    <li>Output is always <code>uint8 PNG</code>, then <code>base64.encodebytes(...)</code>, then dropped into the <code>input_data.data</code> column for the endpoint.</li>
+    <li>The bbox post-rescale (back to the original DICOM dimensions) is still your responsibility — see the <a href="#tab=test">Test tab</a>.</li>
+  </ul>
+
+  <h2>Path B — Roll your own converter</h2>
+  <p>Only if you can't take the toolkit dependency (different language, locked environment, etc.). Mirror the same rules:</p>
   <ul>
     <li><strong>Apply VOI LUT / window-center+width.</strong> Raw 12-bit pixel values look nearly black if you just normalize globally.</li>
     <li><strong>Invert if <code>PhotometricInterpretation == "MONOCHROME1"</code></strong> — common for legacy CR.</li>
     <li>Decode <strong>multi-frame</strong> DICOM frame-by-frame and pick the right view.</li>
     <li>Downscale the longest side to ~1024 px to keep the payload under the gateway limit.</li>
+    <li>Match the toolkit's <strong>1st/99th-percentile normalization</strong> for parity with the reference implementation.</li>
     <li><strong>De-identify</strong> before the image touches the model — burned-in PHI and DICOM tag PHI.</li>
   </ul>
 
-  <h2>Reference converter (Python)</h2>
+  <h3>Minimal Python (no toolkit)</h3>
 <pre><code class="language-python">from pathlib import Path
 import numpy as np, pydicom
 from PIL import Image
@@ -244,8 +278,8 @@ def dicom_to_pil(p: Path) -&gt; Image.Image:
     if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
         arr = arr.max() - arr
     arr = arr.astype(np.float32)
-    if arr.max() &gt; arr.min():
-        arr = (arr - arr.min()) / (arr.max() - arr.min())
+    lo, hi = np.percentile(arr, [1, 99])  # match toolkit's (0.01, 0.99) windowing
+    arr = np.clip((arr - lo) / max(hi - lo, 1e-6), 0, 1)
     return Image.fromarray((arr * 255).astype(np.uint8), mode="L")
 </code></pre>
   <p>Full version with CLI + downscaling: <a href="assets/samples/dicom_to_png.py">dicom_to_png.py</a></p>
@@ -436,7 +470,23 @@ curl -X POST "$SCORING_URI" \
   --data @request.json
 </code></pre>
 
-  <h2>Python invocation + bounding-box visualization</h2>
+  <h2>One-liner with the official toolkit (handles DICOM)</h2>
+  <p>The shortest path — pass <code>.dcm</code> or <code>.png</code> directly, the toolkit handles encoding and the bbox post-rescale convention. See the <a href="#tab=dicom">DICOM tab</a> for full details.</p>
+<pre><code class="language-python">from healthcareai_toolkit.clients import CxrReportGenClient
+
+client = CxrReportGenClient(endpoint_name="cxrreportgen-xxxxx")
+result = client.submit(
+    frontal_image="frontal.dcm",
+    lateral_image="lateral.dcm",
+    indication="65 y/o M with cough and SOB",
+    technique="PA and lateral chest radiograph",
+    comparison="None",
+)
+for finding, boxes in result[0]["output"]:
+    print(finding, boxes)
+</code></pre>
+
+  <h2>Manual Python invocation + bounding-box visualization</h2>
 <pre><code class="language-python">import json, base64
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -816,6 +866,10 @@ az monitor autoscale rule create -g RG --autoscale-name cxr-autoscale \
   <h2>Microsoft GitHub</h2>
   <ul>
     <li><a href="https://github.com/microsoft/healthcareai-examples">microsoft/healthcareai-examples</a></li>
+    <li><a href="https://github.com/microsoft/healthcareai-examples/tree/main/package/healthcareai_toolkit">healthcareai_toolkit (Python package — installable client library)</a></li>
+    <li><a href="https://github.com/microsoft/healthcareai-examples/blob/main/package/healthcareai_toolkit/clients/medimage/cxrreportgen.py"><code>CxrReportGenClient</code> source</a></li>
+    <li><a href="https://github.com/microsoft/healthcareai-examples/blob/main/package/healthcareai_toolkit/clients/medimage/medimagebase.py"><code>MedImageBaseClient</code> source (PNG encode + base64)</a></li>
+    <li><a href="https://github.com/microsoft/healthcareai-examples/blob/main/package/healthcareai_toolkit/data/image_reader.py"><code>ImageReader</code> source (DICOM + image MIME types)</a></li>
     <li><a href="https://github.com/microsoft/healthcareai-examples/blob/main/azureml/medimageinsight/adapter-training.ipynb">MI2 adapter-training (DICOM ingestion pattern)</a></li>
     <li><a href="https://github.com/Azure/azureml-examples/blob/main/sdk/python/foundation-models/healthcare-ai/cxrreportgen/cxr-deploy.ipynb">azureml-examples: cxr-deploy.ipynb</a></li>
     <li><a href="https://microsoft.github.io/healthcareai-examples/">Healthcare AI Examples site</a></li>

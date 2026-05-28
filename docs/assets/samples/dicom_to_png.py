@@ -1,14 +1,32 @@
 """
 DICOM -> 8-bit monochrome PNG for CxrReportGen.
 
-CxrReportGen does NOT accept raw DICOM. You must:
-  1. Read the pixel data.
-  2. Apply windowing (window center / width) and the presentation LUT.
-  3. Invert if PhotometricInterpretation is MONOCHROME1.
-  4. Downscale to 8-bit grayscale and re-encode as PNG / JPG.
-  5. Base64-encode before sending.
+You have two options for sending DICOM to CxrReportGen:
 
-Pattern adapted from microsoft/healthcareai-examples MI2 adapter-training notebook.
+  (A) Recommended: use the official toolkit. It accepts .dcm paths directly
+      and does this conversion for you, matching the model's expected
+      preprocessing (1st/99th-percentile windowing, uint8, PNG, base64):
+
+          pip install "healthcareai_toolkit @ git+https://github.com/microsoft/healthcareai-examples.git#subdirectory=package"
+
+          from healthcareai_toolkit.clients import CxrReportGenClient
+          client = CxrReportGenClient(endpoint_name="CxrReportGen-xxxxx")
+          result = client.submit(frontal_image="frontal.dcm",
+                                 lateral_image="lateral.dcm",
+                                 indication="...", technique="...", comparison="None")
+
+  (B) Standalone (this script): only when you cannot take the toolkit
+      dependency. The endpoint's HTTP wire format is base64 PNG/JPG inside
+      the JSON payload — it never sees DICOM bytes — so you must:
+        1. Read the pixel data.
+        2. Apply VOI LUT / window-center+width.
+        3. Invert if PhotometricInterpretation is MONOCHROME1.
+        4. Apply percentile windowing (1st/99th) to match the toolkit default.
+        5. Convert to 8-bit grayscale and encode as PNG.
+        6. Base64-encode the PNG before placing it in the request payload.
+
+Pattern adapted from microsoft/healthcareai-examples (CxrReportGenClient +
+ImagePreprocessor) and the MI2 adapter-training notebook.
 """
 from __future__ import annotations
 
@@ -25,14 +43,15 @@ def dicom_to_pil(dcm_path: Path) -> Image.Image:
     ds = pydicom.dcmread(str(dcm_path))
     arr = apply_voi_lut(ds.pixel_array, ds)
 
-    # MONOCHROME1: low values are bright -> invert
     if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
         arr = arr.max() - arr
 
-    # Normalize to 8-bit
     arr = arr.astype(np.float32)
-    if arr.max() > arr.min():
-        arr = (arr - arr.min()) / (arr.max() - arr.min())
+    lo, hi = np.percentile(arr, [1, 99])
+    if hi > lo:
+        arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    else:
+        arr = np.zeros_like(arr)
     arr = (arr * 255.0).astype(np.uint8)
 
     return Image.fromarray(arr, mode="L")
