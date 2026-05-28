@@ -1,0 +1,14 @@
+{
+  "input_data": {
+    "columns": ["frontal_image", "lateral_image", "indication", "technique", "comparison"],
+    "index": [0],
+    "data": [[
+      "<base64-encoded JPG/PNG bytes of the frontal chest X-ray>",
+      "<base64-encoded JPG/PNG bytes of the lateral chest X-ray>",
+      "65 y/o M with cough and shortness of breath",
+      "PA and lateral chest radiograph",
+      "None"
+    ]]
+  },
+  "params": {}
+}

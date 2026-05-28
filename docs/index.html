@@ -1,0 +1,874 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="End-to-end deployment and cost-planning guide for Microsoft CXRReportGen on Azure.">
+<title>CXRReportGen on Azure — Deployment &amp; Cost Guide</title>
+<link rel="stylesheet" href="assets/css/site.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" media="(prefers-color-scheme: dark)">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="header-inner">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span> CXRReportGen on Azure</div>
+    <div class="header-spacer"></div>
+    <a class="btn btn--ghost" href="https://github.com/patmeh1/cxrreportgen-deploy-guide" target="_blank" rel="noopener">GitHub</a>
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle theme">Theme</button>
+  </div>
+</header>
+
+<div class="disclaimer-banner" role="region" aria-label="Important">
+  <strong>Research only.</strong> CXRReportGen is not for clinical diagnosis or treatment. See the
+  <a href="#tab=compliance">Compliance &amp; Responsible AI</a> tab.
+</div>
+
+<nav class="tab-nav" role="tablist" aria-label="Guide sections">
+  <div class="tab-nav-inner">
+    <button class="tab-button" role="tab" data-tab="overview"        aria-controls="tab-overview"        id="tabbtn-overview">Overview</button>
+    <button class="tab-button" role="tab" data-tab="prereqs"         aria-controls="tab-prereqs"         id="tabbtn-prereqs">Prerequisites</button>
+    <button class="tab-button" role="tab" data-tab="architecture"    aria-controls="tab-architecture"    id="tabbtn-architecture">Architecture</button>
+    <button class="tab-button" role="tab" data-tab="dicom"           aria-controls="tab-dicom"           id="tabbtn-dicom">DICOM Ingestion</button>
+    <button class="tab-button" role="tab" data-tab="deploy"          aria-controls="tab-deploy"          id="tabbtn-deploy">Deploy</button>
+    <button class="tab-button" role="tab" data-tab="test"            aria-controls="tab-test"            id="tabbtn-test">Test the Endpoint</button>
+    <button class="tab-button" role="tab" data-tab="networking"      aria-controls="tab-networking"      id="tabbtn-networking">Networking &amp; Security</button>
+    <button class="tab-button" role="tab" data-tab="compliance"      aria-controls="tab-compliance"      id="tabbtn-compliance">Compliance &amp; RAI</button>
+    <button class="tab-button" role="tab" data-tab="cost-calculator" aria-controls="tab-cost-calculator" id="tabbtn-cost-calculator">Cost Calculator</button>
+    <button class="tab-button" role="tab" data-tab="ops"             aria-controls="tab-ops"             id="tabbtn-ops">Monitoring &amp; Ops</button>
+    <button class="tab-button" role="tab" data-tab="troubleshooting" aria-controls="tab-troubleshooting" id="tabbtn-troubleshooting">Troubleshooting</button>
+    <button class="tab-button" role="tab" data-tab="references"      aria-controls="tab-references"      id="tabbtn-references">References</button>
+  </div>
+</nav>
+<div class="tab-select-wrap">
+  <label for="tab-select" class="visually-hidden">Section</label>
+  <select id="tab-select" aria-label="Jump to section">
+    <option value="overview">Overview</option>
+    <option value="prereqs">Prerequisites</option>
+    <option value="architecture">Architecture</option>
+    <option value="dicom">DICOM Ingestion</option>
+    <option value="deploy">Deploy</option>
+    <option value="test">Test the Endpoint</option>
+    <option value="networking">Networking &amp; Security</option>
+    <option value="compliance">Compliance &amp; RAI</option>
+    <option value="cost-calculator">Cost Calculator</option>
+    <option value="ops">Monitoring &amp; Ops</option>
+    <option value="troubleshooting">Troubleshooting</option>
+    <option value="references">References</option>
+  </select>
+</div>
+
+<main id="main">
+
+<!-- =================== Overview =================== -->
+<section class="tab-panel" id="tab-overview" role="tabpanel" aria-labelledby="tabbtn-overview" tabindex="-1">
+  <h1>Deploying CXRReportGen on Azure</h1>
+  <p class="lede">CXRReportGen is a multimodal Microsoft healthcare AI model that generates structured radiology reports from chest X-rays — frontal + lateral images, optional indication / technique / comparison text — and returns findings with bounding-box localizations.</p>
+
+  <h2>What you'll do</h2>
+  <ol>
+    <li>Stand up an Azure Machine Learning workspace (or a Microsoft Foundry project).</li>
+    <li>Request quota for the <code>Standard_NC24ads_A100_v4</code> SKU.</li>
+    <li>Resolve the <code>CxrReportGen</code> model from the AzureML system registry.</li>
+    <li>Deploy it to a Managed Online Endpoint (A100 80GB).</li>
+    <li>Convert DICOM → 8-bit PNG → base64 in your ingestion pipeline.</li>
+    <li>Wire monitoring, private networking, and cost guardrails.</li>
+  </ol>
+
+  <h2>Model at a glance</h2>
+  <table>
+    <thead><tr><th>Aspect</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>Registry</td><td><code>registry_name="azureml"</code> · model <code>CxrReportGen</code> · label <code>latest</code></td></tr>
+      <tr><td>Architecture</td><td>BiomedCLIP (image encoder) + Phi-3-mini-4k-instruct (text encoder)</td></tr>
+      <tr><td>Required SKU</td><td><code>Standard_NC24ads_A100_v4</code> (1× A100 80GB · 24 vCPU · 220 GiB)</td></tr>
+      <tr><td>Auth</td><td>Key or AAD token on the Managed Online Endpoint</td></tr>
+      <tr><td>Inputs</td><td><code>frontal_image</code>, <code>lateral_image</code> (base64 JPG/PNG), <code>indication</code>, <code>technique</code>, <code>comparison</code></td></tr>
+      <tr><td>Outputs</td><td>List of <code>[finding, [[x_min,y_min,x_max,y_max], …]]</code> normalized to a center-cropped square</td></tr>
+      <tr><td>Typical latency</td><td>2–6 s per study on 1× A100. Set <code>request_timeout_ms=90000</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout callout--danger">
+    <strong>Not for clinical use.</strong> Per the Microsoft Healthcare AI Examples notice, "Healthcare AI Examples is a code sample collection intended for research and model development exploration only. The models, code and examples are not designed or intended to be deployed in clinical settings as-is nor for use in the diagnosis or treatment of any health or medical condition." Treat outputs as a research assist; require human review.
+  </div>
+
+  <h2>30-second deploy</h2>
+<pre><code class="language-python">from azure.ai.ml import MLClient
+from azure.ai.ml.entities import ManagedOnlineEndpoint, ManagedOnlineDeployment, OnlineRequestSettings
+from azure.identity import DefaultAzureCredential
+
+cred = DefaultAzureCredential()
+model = MLClient(cred, registry_name="azureml").models.get(name="CxrReportGen", label="latest")
+ml = MLClient.from_config(cred)
+
+ml.online_endpoints.begin_create_or_update(ManagedOnlineEndpoint(name="cxr-endpoint")).result()
+ml.online_deployments.begin_create_or_update(ManagedOnlineDeployment(
+    name="cxr-v1", endpoint_name="cxr-endpoint", model=model,
+    instance_type="Standard_NC24ads_A100_v4", instance_count=1,
+    request_settings=OnlineRequestSettings(request_timeout_ms=90000),
+    app_insights_enabled=True,
+)).result()
+</code></pre>
+</section>
+
+<!-- =================== Prerequisites =================== -->
+<section class="tab-panel" id="tab-prereqs" role="tabpanel" aria-labelledby="tabbtn-prereqs" tabindex="-1">
+  <h1>Prerequisites</h1>
+  <p class="lede">Cover these before the first <code>begin_create_or_update</code> call — most deployment failures are quota or RBAC issues, not code.</p>
+
+  <h2>1. Subscription</h2>
+  <ul>
+    <li>An <strong>Azure subscription</strong> (Pay-As-You-Go, EA, or MCA). Free tier won't carry an A100.</li>
+    <li>If you'll handle PHI, sign a <strong>BAA with Microsoft</strong> via the Microsoft Privacy &amp; Trust Center.</li>
+    <li>Decide on a <strong>landing zone</strong> (single subscription vs. hub/spoke). For a regulated workload, isolate this in its own subscription.</li>
+  </ul>
+
+  <h2>2. Region selection</h2>
+  <p>CXRReportGen depends on A100 availability. Validate the SKU in the target region before committing.</p>
+  <table>
+    <thead><tr><th>Region</th><th>NC24ads A100 v4</th><th>NC48ads A100 v4</th><th>NC96ads A100 v4</th><th>Foundry</th></tr></thead>
+    <tbody id="region-matrix">
+      <tr><td colspan="5">Loading region-availability.json…</td></tr>
+    </tbody>
+  </table>
+  <div class="callout callout--info"><strong>Data residency.</strong> Match the region to your patient population's residency requirements (HIPAA, GDPR Article 44 transfer rules, state laws).</div>
+
+  <h2>3. RBAC</h2>
+  <ul>
+    <li><strong>Workspace:</strong> Contributor or Owner — or a custom role granting <code>Microsoft.MachineLearningServices/workspaces/onlineEndpoints/*</code>.</li>
+    <li><strong>If using AML Studio UI:</strong> also <code>Microsoft.Resources/deployments/write</code> from the resource-group owner.</li>
+    <li><strong>For CI/CD:</strong> a service principal with the same scope; store the secret in Key Vault, not in the repo.</li>
+  </ul>
+
+  <h2>4. Quota walkthrough — <code>NCadsA100v4</code></h2>
+  <ol>
+    <li>Azure portal → <strong>Quotas</strong> → <strong>Compute</strong>.</li>
+    <li>Filter by subscription + region + provider = <em>Microsoft.MachineLearningServices</em>.</li>
+    <li>Find <strong>Standard NCadsA100_v4 Family Cluster Dedicated vCPUs</strong>.</li>
+    <li>Request <strong>≥ 29 vCPU</strong> for a single instance (24 + the ~20% rolling-upgrade reservation AML imposes).</li>
+    <li>For autoscale, multiply by your max instance count.</li>
+  </ol>
+  <div class="callout callout--warn"><strong>+20% rule.</strong> Azure ML reserves ~20% of the requested cores for rolling upgrades on most SKUs. If your quota is exactly 24 vCPU you cannot deploy a single instance. Request 29+.</div>
+
+  <h2>5. Tooling</h2>
+<pre><code class="language-bash"># macOS / Linux
+brew install azure-cli
+az extension add -n ml
+az login
+az account set --subscription &lt;SUBSCRIPTION_ID&gt;
+
+# Python SDK v2
+python3.10 -m venv .venv &amp;&amp; source .venv/bin/activate
+pip install azure-ai-ml azure-identity pydicom pillow simpleitk
+
+# azd (for IaC path)
+curl -fsSL https://aka.ms/install-azd.sh | bash
+
+# Docker (optional, for local endpoint debugging)
+# https://docs.docker.com/engine/install/
+</code></pre>
+
+  <h2>6. Other dependencies (created with the workspace if missing)</h2>
+  <ul>
+    <li>Azure Storage account (workspace artifacts + your input/output blobs)</li>
+    <li>Azure Container Registry (model image)</li>
+    <li>Azure Key Vault (keys + secrets)</li>
+    <li>Application Insights + Log Analytics workspace (telemetry)</li>
+    <li>Optional: Azure Health Data Services workspace (DICOM service + De-id service)</li>
+    <li>Optional Foundry add-ons: Azure AI Search, Azure Cosmos DB</li>
+  </ul>
+</section>
+
+<!-- =================== Architecture =================== -->
+<section class="tab-panel" id="tab-architecture" role="tabpanel" aria-labelledby="tabbtn-architecture" tabindex="-1">
+  <h1>Architecture</h1>
+  <p class="lede">Two complementary views: the Microsoft Foundry topology (when you front the endpoint with an agent), and the standalone Managed Online Endpoint.</p>
+
+  <h2>Reference 1 — Foundry + Foundry Agent Service</h2>
+  <p>This reproduces the customer-provided reference diagram: a Foundry project, the Foundry Agent Service in its integration subnet, and the dependency triplet of Azure AI Search (file search), Cosmos DB (memory), and Azure Storage (file storage). All traffic flows via private endpoints behind NSGs.</p>
+  <img src="assets/img/architecture-foundry.svg" alt="Foundry project connecting to Foundry Agent Service via an integration subnet, with AI Search, Cosmos DB, and Storage dependencies behind private endpoints.">
+
+  <h2>Reference 2 — Standalone CXRReportGen endpoint</h2>
+  <p>The minimum viable architecture for serving CXRReportGen: AML workspace, managed online endpoint, A100 deployment, and the core dependency set with private DNS zones.</p>
+  <img src="assets/img/architecture-endpoint.svg" alt="AML workspace with managed online endpoint backed by an A100 deployment; depends on Storage, Key Vault, ACR, App Insights, Log Analytics with private endpoints in customer VNet.">
+
+  <h2>End-to-end request flow</h2>
+<pre><code class="language-mermaid">sequenceDiagram
+  participant PACS as PACS / DICOMweb
+  participant Func as Ingestion (Container App / Function)
+  participant Deid as De-id (AHDS)
+  participant Conv as DICOM->PNG converter
+  participant APIM as APIM / Front Door
+  participant EP as AML Online Endpoint (A100)
+  participant Blob as Blob (findings + overlays)
+  participant FHIR as FHIR / Power BI
+
+  PACS->>Func: New study event (DICOMweb / Event Grid)
+  Func->>Deid: De-identify DICOM
+  Deid->>Conv: De-identified DICOM
+  Conv->>APIM: base64 frontal + lateral
+  APIM->>EP: scoring request
+  EP-->>APIM: findings + bboxes
+  APIM-->>Func: response
+  Func->>Blob: persist findings + bbox overlay
+  Func->>FHIR: DiagnosticReport write-back
+</code></pre>
+</section>
+
+<!-- =================== DICOM =================== -->
+<section class="tab-panel" id="tab-dicom" role="tabpanel" aria-labelledby="tabbtn-dicom" tabindex="-1">
+  <h1>DICOM Ingestion Pipeline</h1>
+  <p class="lede">CXRReportGen does <strong>not</strong> accept raw DICOM. You convert each frontal/lateral image to an 8-bit monochrome PNG and base64-encode it before posting.</p>
+
+  <h2>Conversion rules you must respect</h2>
+  <ul>
+    <li><strong>Apply VOI LUT / window-center+width.</strong> Raw 12-bit pixel values look nearly black if you just normalize globally.</li>
+    <li><strong>Invert if <code>PhotometricInterpretation == "MONOCHROME1"</code></strong> — common for legacy CR.</li>
+    <li>Decode <strong>multi-frame</strong> DICOM frame-by-frame and pick the right view.</li>
+    <li>Downscale the longest side to ~1024 px to keep the payload under the gateway limit.</li>
+    <li><strong>De-identify</strong> before the image touches the model — burned-in PHI and DICOM tag PHI.</li>
+  </ul>
+
+  <h2>Reference converter (Python)</h2>
+<pre><code class="language-python">from pathlib import Path
+import numpy as np, pydicom
+from PIL import Image
+from pydicom.pixel_data_handlers.util import apply_voi_lut
+
+def dicom_to_pil(p: Path) -&gt; Image.Image:
+    ds = pydicom.dcmread(str(p))
+    arr = apply_voi_lut(ds.pixel_array, ds)
+    if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
+        arr = arr.max() - arr
+    arr = arr.astype(np.float32)
+    if arr.max() &gt; arr.min():
+        arr = (arr - arr.min()) / (arr.max() - arr.min())
+    return Image.fromarray((arr * 255).astype(np.uint8), mode="L")
+</code></pre>
+  <p>Full version with CLI + downscaling: <a href="assets/samples/dicom_to_png.py">dicom_to_png.py</a></p>
+
+  <h2>Reference converter (C#)</h2>
+<pre><code class="language-csharp">// NuGet: fo-dicom, SixLabors.ImageSharp
+using FellowOakDicom;
+using FellowOakDicom.Imaging;
+using SixLabors.ImageSharp;
+
+var file = await DicomFile.OpenAsync(dicomPath);
+var image = new DicomImage(file.Dataset);
+using var rendered = image.RenderImage().AsSharpImage();
+await rendered.SaveAsPngAsync(pngPath);
+</code></pre>
+
+  <h2>Ingestion patterns</h2>
+  <ul>
+    <li><strong>DICOMweb (preferred):</strong> stand up the Azure Health Data Services DICOM service. PACS routes new studies via STOW-RS; Event Grid fires; an Azure Function or Container Apps job converts and calls the endpoint.</li>
+    <li><strong>File drop:</strong> watch a Storage container with Event Grid; same handler.</li>
+    <li><strong>HL7v2 ORU^R01 write-back:</strong> emit findings as an ORU message into Mirth Connect / Cloverleaf for the EHR.</li>
+    <li><strong>FHIR DiagnosticReport:</strong> persist the structured findings as a <code>DiagnosticReport</code> with <code>Observation</code> children — drop bounding-box overlays in the <code>presentedForm</code> attachment.</li>
+    <li><strong>MONAI Deploy alternative:</strong> if you already run MONAI, wrap the converter + invoker as a MAP and let MONAI orchestrate.</li>
+  </ul>
+
+  <h2>PHI scrubbing</h2>
+  <ul>
+    <li>Use the <strong>Azure Health Data Services De-identification service</strong> on the DICOM tags.</li>
+    <li>Apply <strong>burned-in PHI removal</strong> (most CR/DR units stamp patient name into the corner) — Microsoft Presidio + OCR is a common pre-processor.</li>
+    <li>Redact PHI from <strong>App Insights logs</strong> — never log raw payloads. Use the Application Insights <em>data masking</em> feature.</li>
+  </ul>
+
+  <h2>Batching for throughput</h2>
+  <p>The endpoint accepts one study per request. To increase throughput on a single A100:</p>
+  <ul>
+    <li>Run N concurrent workers in your ingestion job; set <code>max_concurrent_requests_per_instance</code> on the deployment.</li>
+    <li>Watch GPU utilization (DCGM) — saturate before adding instances.</li>
+    <li>For backfills, queue requests in Service Bus with a dead-letter for repeated failures.</li>
+  </ul>
+</section>
+
+<!-- =================== Deploy =================== -->
+<section class="tab-panel" id="tab-deploy" role="tabpanel" aria-labelledby="tabbtn-deploy" tabindex="-1">
+  <h1>Deploy — Step-by-step</h1>
+  <p class="lede">Four equivalent paths. Pick one. The Python SDK path mirrors the official <a href="https://github.com/Azure/azureml-examples/blob/main/sdk/python/foundation-models/healthcare-ai/cxrreportgen/cxr-deploy.ipynb" target="_blank" rel="noopener">cxr-deploy.ipynb</a> notebook.</p>
+
+  <div class="inner-tabs" role="tablist" aria-label="Deployment method">
+    <button class="inner-tab-btn" role="tab" data-inner="studio"  aria-selected="true">Studio (no-code)</button>
+    <button class="inner-tab-btn" role="tab" data-inner="sdk"     aria-selected="false">Python SDK v2</button>
+    <button class="inner-tab-btn" role="tab" data-inner="cli"     aria-selected="false">Azure CLI v2</button>
+    <button class="inner-tab-btn" role="tab" data-inner="azd"     aria-selected="false">azd (IaC)</button>
+  </div>
+
+  <div class="inner-tab-panel active" data-inner="studio">
+    <h2>Azure Machine Learning Studio</h2>
+    <ol>
+      <li>Open <a href="https://ml.azure.com" target="_blank" rel="noopener">ml.azure.com</a> and select your workspace.</li>
+      <li><strong>Model catalog</strong> → search <em>CxrReportGen</em> → <strong>Deploy</strong> → <em>Real-time endpoint</em>.</li>
+      <li>Endpoint name: <code>cxrreportgen-prod</code>. Auth: <em>Key</em>. Click <strong>Next</strong>.</li>
+      <li>Deployment name: <code>cxr-v1</code>. SKU: <strong>Standard_NC24ads_A100_v4</strong>. Instances: 1.</li>
+      <li>Request settings → <strong>Request timeout (ms)</strong> = 90000. <strong>Application Insights</strong> = On.</li>
+      <li>Review → <strong>Create</strong>. Endpoint goes Healthy in 10–20 min as the image pulls.</li>
+      <li>Open the endpoint → <strong>Test</strong> tab → paste the sample JSON below to verify.</li>
+    </ol>
+    <div class="callout callout--warn"><strong>Studio UI gotcha.</strong> The Studio "Test" tab logs your request body. Don't paste PHI there.</div>
+  </div>
+
+  <div class="inner-tab-panel" data-inner="sdk">
+    <h2>Python SDK v2</h2>
+    <p>Full script: <a href="assets/samples/deploy.py">deploy.py</a>. Inline walkthrough:</p>
+<pre><code class="language-python">from azure.ai.ml import MLClient
+from azure.ai.ml.entities import (
+    ManagedOnlineEndpoint, ManagedOnlineDeployment, OnlineRequestSettings,
+)
+from azure.identity import DefaultAzureCredential, InteractiveBrowserCredential
+import random, string
+
+try:
+    cred = DefaultAzureCredential()
+    cred.get_token("https://management.azure.com/.default")
+except Exception:
+    cred = InteractiveBrowserCredential()
+
+# 1. Resolve the model from the AzureML system registry
+registry = MLClient(cred, registry_name="azureml")
+model = registry.models.get(name="CxrReportGen", label="latest")
+
+# 2. Connect to your workspace (requires config.json or MLClient(cred, sub, rg, ws))
+ml = MLClient.from_config(cred)
+
+# 3. Create an endpoint with a unique suffix
+suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
+endpoint_name = f"cxrreportgen-{suffix}"
+ml.online_endpoints.begin_create_or_update(
+    ManagedOnlineEndpoint(name=endpoint_name, auth_mode="key")
+).result()
+
+# 4. Create the A100 deployment
+deployment = ManagedOnlineDeployment(
+    name="cxr-v1",
+    endpoint_name=endpoint_name,
+    model=model,
+    instance_type="Standard_NC24ads_A100_v4",
+    instance_count=1,
+    request_settings=OnlineRequestSettings(request_timeout_ms=90000),
+    app_insights_enabled=True,
+)
+ml.online_deployments.begin_create_or_update(deployment).result()
+
+# 5. Shift traffic
+ep = ml.online_endpoints.get(endpoint_name)
+ep.traffic = {"cxr-v1": 100}
+ml.online_endpoints.begin_create_or_update(ep).result()
+print("Scoring URI:", ep.scoring_uri)
+</code></pre>
+  </div>
+
+  <div class="inner-tab-panel" data-inner="cli">
+    <h2>Azure CLI v2</h2>
+    <p>Save these two YAMLs side-by-side: <a href="assets/samples/endpoint.yml">endpoint.yml</a>, <a href="assets/samples/deployment.yml">deployment.yml</a>.</p>
+<pre><code class="language-bash">az login
+az account set --subscription &lt;SUBSCRIPTION_ID&gt;
+az configure --defaults workspace=&lt;WORKSPACE&gt; group=&lt;RESOURCE_GROUP&gt;
+
+az ml online-endpoint create --file endpoint.yml
+az ml online-deployment create --file deployment.yml --all-traffic
+
+# Smoke test
+az ml online-endpoint invoke --name cxrreportgen-endpoint \
+  --request-file request.json
+</code></pre>
+  </div>
+
+  <div class="inner-tab-panel" data-inner="azd">
+    <h2>azd (Infrastructure as Code)</h2>
+    <p>Use the AI/ML endpoint host type. Reference: <a href="https://learn.microsoft.com/azure/developer/azure-developer-cli/azure-ai-ml-endpoints" target="_blank" rel="noopener">azd AI/ML online endpoints</a>.</p>
+<pre><code class="language-yaml"># azure.yaml
+name: cxrreportgen-azd
+services:
+  cxr:
+    host: ai.endpoint
+    config:
+      workspace: ${AZUREAI_PROJECT_NAME}
+      deployment:
+        path: ./deployment.yml
+        environment:
+          PRT_CONFIG_OVERRIDE: deployment.subscription_id=${AZURE_SUBSCRIPTION_ID},deployment.resource_group=${AZURE_RESOURCE_GROUP},deployment.workspace_name=${AZUREAI_PROJECT_NAME},deployment.endpoint_name=${AZUREAI_ENDPOINT_NAME},deployment.deployment_name=${AZUREAI_DEPLOYMENT_NAME}
+</code></pre>
+<pre><code class="language-bash">azd init
+azd env set AZURE_LOCATION eastus
+azd env set AZUREAI_PROJECT_NAME my-foundry-project
+azd up
+</code></pre>
+    <div class="callout callout--info"><strong>Tip.</strong> Pair this with a Bicep module for the workspace, ACR, KV, Storage, App Insights, Log Analytics, and the private endpoints so the whole stack is reproducible.</div>
+  </div>
+</section>
+
+<!-- =================== Test =================== -->
+<section class="tab-panel" id="tab-test" role="tabpanel" aria-labelledby="tabbtn-test" tabindex="-1">
+  <h1>Test the Endpoint</h1>
+  <p class="lede">After the deployment goes Healthy, exercise it with the official sample images, then your own DICOM-converted PNGs.</p>
+
+  <h2>Sample request body</h2>
+<pre><code class="language-json">{
+  "input_data": {
+    "columns": ["frontal_image","lateral_image","indication","technique","comparison"],
+    "index": [0],
+    "data": [[
+      "&lt;base64 JPG/PNG frontal&gt;",
+      "&lt;base64 JPG/PNG lateral&gt;",
+      "65 y/o M with cough and SOB",
+      "PA and lateral chest radiograph",
+      "None"
+    ]]
+  },
+  "params": {}
+}
+</code></pre>
+
+  <h2>cURL (bearer token)</h2>
+<pre><code class="language-bash">SCORING_URI="https://cxrreportgen-xxxxx.eastus.inference.ml.azure.com/score"
+TOKEN=$(az ml online-endpoint get-credentials -n cxrreportgen-endpoint --query primaryKey -o tsv)
+
+curl -X POST "$SCORING_URI" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "azureml-model-deployment: cxr-v1" \
+  --data @request.json
+</code></pre>
+
+  <h2>Python invocation + bounding-box visualization</h2>
+<pre><code class="language-python">import json, base64
+from PIL import Image
+import matplotlib.pyplot as plt
+from azure.ai.ml import MLClient
+from azure.identity import DefaultAzureCredential
+
+ml = MLClient.from_config(DefaultAzureCredential())
+
+def b64(p):
+    return base64.encodebytes(open(p, "rb").read()).decode("utf-8")
+
+payload = {"input_data": {
+    "columns": ["frontal_image","lateral_image","indication","technique","comparison"],
+    "index": [0],
+    "data": [[b64("frontal.png"), b64("lateral.png"), "", "", "None"]],
+}, "params": {}}
+
+json.dump(payload, open("req.json","w"))
+resp = ml.online_endpoints.invoke(
+    endpoint_name="cxrreportgen-xxxxx",
+    deployment_name="cxr-v1",
+    request_file="req.json",
+)
+findings = json.loads(json.loads(resp)[0]["output"])
+
+# Bbox coords are normalized against a center-cropped square.
+# Rescale to original image dimensions before drawing.
+def to_original(box, w, h):
+    side = min(w, h)
+    ox, oy = (w - side) // 2, (h - side) // 2
+    x1, y1, x2, y2 = box
+    return (x1 * side + ox, y1 * side + oy, x2 * side + ox, y2 * side + oy)
+
+img = Image.open("frontal.png"); w, h = img.size
+fig, ax = plt.subplots(); ax.imshow(img, cmap="gray")
+for i, (text, boxes) in enumerate(findings):
+    for box in (boxes or []):
+        x1, y1, x2, y2 = to_original(box, w, h)
+        ax.add_patch(plt.Rectangle((x1,y1), x2-x1, y2-y1, fill=False, ec="red", lw=2))
+plt.show()
+</code></pre>
+
+  <div class="callout callout--warn"><strong>Bounding box gotcha.</strong> The model returns coordinates relative to a <em>center-cropped square</em>. Skipping the rescale (above) is the #1 cause of mis-aligned overlays.</div>
+
+  <h2>Browser demo</h2>
+  <p>Paste your endpoint URI + key (stored only in this tab's <code>sessionStorage</code> — never persisted), drop a PNG, and call the endpoint directly. Only run this from a workstation inside your corporate boundary.</p>
+<pre><code class="language-html">&lt;input id="ep" placeholder="https://...score"&gt;
+&lt;input id="key" placeholder="endpoint key" type="password"&gt;
+&lt;input id="file" type="file" accept="image/png,image/jpeg"&gt;
+&lt;button id="go"&gt;Score&lt;/button&gt;
+&lt;pre id="out"&gt;&lt;/pre&gt;
+&lt;script&gt;
+go.onclick = async () =&gt; {
+  const f = file.files[0]; if (!f) return;
+  const b = btoa(String.fromCharCode(...new Uint8Array(await f.arrayBuffer())));
+  const body = { input_data: { columns:["frontal_image","lateral_image","indication","technique","comparison"],
+    index:[0], data:[[b,b,"","","None"]] }, params:{} };
+  sessionStorage.setItem('cxr_ep', ep.value); sessionStorage.setItem('cxr_key', key.value);
+  const r = await fetch(ep.value, { method:'POST',
+    headers:{ 'Content-Type':'application/json','Authorization':'Bearer '+key.value },
+    body: JSON.stringify(body) });
+  out.textContent = await r.text();
+};
+&lt;/script&gt;
+</code></pre>
+</section>
+
+<!-- =================== Networking =================== -->
+<section class="tab-panel" id="tab-networking" role="tabpanel" aria-labelledby="tabbtn-networking" tabindex="-1">
+  <h1>Networking &amp; Security</h1>
+  <p class="lede">Zero-trust posture for a PHI-adjacent workload. None of these are "nice-to-haves" once the model sees real images.</p>
+
+  <h2>Workspace isolation</h2>
+  <ul>
+    <li>Create the AML workspace with <strong>managed VNet</strong> (network isolation = Enabled).</li>
+    <li>Disable public access on the workspace; expose only via <strong>private endpoint</strong>.</li>
+    <li>Set <code>image_build_compute</code> on a private subnet (otherwise image builds break).</li>
+  </ul>
+
+  <h2>Private endpoints to provision</h2>
+  <table>
+    <thead><tr><th>Resource</th><th>Private DNS zone</th></tr></thead>
+    <tbody>
+      <tr><td>AML workspace</td><td><code>privatelink.api.azureml.ms</code> + <code>privatelink.notebooks.azure.net</code></td></tr>
+      <tr><td>Online endpoint (data plane)</td><td><code>privatelink.&lt;region&gt;.inference.ml.azure.com</code></td></tr>
+      <tr><td>Storage (blob/file/queue)</td><td><code>privatelink.blob.core.windows.net</code>, <code>privatelink.file.core.windows.net</code></td></tr>
+      <tr><td>Key Vault</td><td><code>privatelink.vaultcore.azure.net</code></td></tr>
+      <tr><td>Container Registry</td><td><code>privatelink.azurecr.io</code></td></tr>
+      <tr><td>App Insights / Log Analytics</td><td><code>privatelink.monitor.azure.com</code>, <code>privatelink.oms.opinsights.azure.com</code>, <code>privatelink.ods.opinsights.azure.com</code></td></tr>
+      <tr><td>Azure Health Data Services</td><td><code>privatelink.dicom.azurehealthcareapis.com</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>NSG &amp; egress</h2>
+  <ul>
+    <li>Default-deny outbound at the subnet; allow only the FQDNs AML requires (see <em>required FQDNs for managed VNet</em>).</li>
+    <li>Add an <strong>Azure Firewall</strong> with FQDN tags <code>AzureMachineLearning</code>, <code>AzureActiveDirectory</code>, <code>MicrosoftContainerRegistry</code> for egress control.</li>
+  </ul>
+
+  <h2>Front-end pattern</h2>
+  <ul>
+    <li><strong>APIM</strong> in front of the endpoint for: subscription-key fan-out, rate limiting per partner, response caching of metadata, header injection (<code>azureml-model-deployment</code> for blue/green).</li>
+    <li><strong>Azure Front Door + WAF</strong> for global anycast + OWASP rules.</li>
+    <li><strong>mTLS</strong> from PACS → APIM using client certs minted in your CA.</li>
+  </ul>
+
+  <h2>Identity &amp; keys</h2>
+  <ul>
+    <li>Endpoint auth: prefer <code>aad_token</code> over <code>key</code>; rotate keys quarterly if you must use them.</li>
+    <li>Workspace + Storage + Key Vault on <strong>customer-managed keys (CMK)</strong> from your Key Vault.</li>
+    <li>Managed identity for the endpoint to read images from Storage — no SAS in code.</li>
+  </ul>
+
+  <h2>Data plane hardening</h2>
+  <ul>
+    <li>Disable local auth on Storage; rely on Azure RBAC.</li>
+    <li>Enable <strong>Storage immutability + soft delete</strong> for finding overlays you must retain.</li>
+    <li>Turn on <strong>Defender for Cloud</strong> for AI workloads, Key Vault, Storage, Containers.</li>
+  </ul>
+</section>
+
+<!-- =================== Compliance =================== -->
+<section class="tab-panel" id="tab-compliance" role="tabpanel" aria-labelledby="tabbtn-compliance" tabindex="-1">
+  <h1>Compliance &amp; Responsible AI</h1>
+  <p class="lede">Read before the first byte of PHI leaves your network.</p>
+
+  <h2>Microsoft's research-only disclaimer (verbatim)</h2>
+  <div class="callout callout--danger">
+    Healthcare AI Examples is a code sample collection intended for research and model development exploration only. The models, code and examples are not designed or intended to be deployed in clinical settings as-is nor for use in the diagnosis or treatment of any health or medical condition, and the individual models' performances for such purposes have not been established. By using the Healthcare AI Examples, you are acknowledging that you bear sole responsibility and liability for any use of these models and code, including verification of outputs and incorporation into any product or service intended for a medical purpose or to inform clinical decision-making, compliance with applicable healthcare laws and regulations, and obtaining any necessary clearances or approvals.
+  </div>
+
+  <h2>Regulatory posture</h2>
+  <table>
+    <thead><tr><th>Framework</th><th>Position</th></tr></thead>
+    <tbody>
+      <tr><td>HIPAA / HITECH</td><td>Azure services in scope under the Microsoft BAA. CXRReportGen output is informational; it does not change your role as covered entity / business associate.</td></tr>
+      <tr><td>HITRUST CSF</td><td>Azure HITRUST inheritance applies to underlying services; you remain responsible for application-layer controls.</td></tr>
+      <tr><td>GDPR</td><td>Choose an EU/UK region. Configure data subject request handling for stored findings. Document the lawful basis.</td></tr>
+      <tr><td>FDA SaMD</td><td>CXRReportGen as shipped is <strong>not</strong> FDA-cleared. Any clinical-decision-support deployment requires your own regulatory pathway.</td></tr>
+      <tr><td>EU AI Act</td><td>Likely <strong>high-risk</strong> if used in healthcare diagnostics → conformity assessment, risk management, post-market monitoring required.</td></tr>
+      <tr><td>ISO 27001 / 27018 / 27701</td><td>Inheritable from Azure; document your control mapping.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Responsible AI checklist</h2>
+  <ul>
+    <li>Publish a <strong>model card</strong> referencing Microsoft's documentation + your fine-tuning data.</li>
+    <li>Run an <strong>evaluation harness</strong> across demographic slices before any pilot; track AUROC, F1, hallucination rate, bbox IoU.</li>
+    <li>Mandatory <strong>human-in-the-loop</strong> sign-off on every report.</li>
+    <li>Maintain a <strong>feedback channel</strong> so radiologists can flag bad outputs back to the dataset.</li>
+    <li>Disable model output in <strong>edge cases</strong> the model wasn't validated on (pediatrics, supine films, post-op).</li>
+  </ul>
+
+  <h2>Audit logging</h2>
+  <ul>
+    <li>Enable <strong>Diagnostic Settings</strong> on the workspace, endpoint, KV, Storage → Log Analytics + a long-term archive in Storage immutable container.</li>
+    <li>Capture: scoring requests count, latency, deployment changes, key access, role assignments.</li>
+    <li><strong>Never</strong> log payloads. Redact at the App Insights SDK with a TelemetryInitializer.</li>
+  </ul>
+</section>
+
+<!-- =================== Cost Calculator =================== -->
+<section class="tab-panel" id="tab-cost-calculator" role="tabpanel" aria-labelledby="tabbtn-cost-calculator" tabindex="-1">
+  <h1>Cost Calculator</h1>
+  <p class="lede">Client-side estimator that adapts to your DICOM volume, retention policy, networking choices, and Foundry add-ons. <span id="rates-stamp" style="color: var(--fg-muted)"></span></p>
+
+  <div class="calc-grid">
+    <form class="calc-controls" onsubmit="event.preventDefault()">
+
+      <fieldset><legend>Region &amp; volume</legend>
+        <div class="calc-row"><label for="region">Region</label><select id="region"></select></div>
+        <div class="calc-row"><label for="studies_day">DICOM studies per day</label><input id="studies_day" type="number" min="0" value="500"></div>
+        <div class="calc-row"><label for="images_study">Images per study</label><input id="images_study" type="number" min="1" max="4" value="2"></div>
+        <div class="calc-row"><label for="dicom_mb">Average DICOM size (MB)</label><input id="dicom_mb" type="number" min="0" step="0.1" value="8"></div>
+        <div class="calc-row"><label for="png_kb">Converted PNG size (KB)</label><input id="png_kb" type="number" min="0" value="350"></div>
+      </fieldset>
+
+      <fieldset><legend>Retention</legend>
+        <div class="calc-row"><label for="hot_days">Hot tier (days)</label><input id="hot_days" type="number" min="0" value="30"></div>
+        <div class="calc-row"><label for="cool_days">Cool tier (days)</label><input id="cool_days" type="number" min="0" value="90"></div>
+        <div class="calc-row"><label for="archive_days">Archive tier (days)</label><input id="archive_days" type="number" min="0" value="2555"></div>
+        <div class="calc-row inline"><input id="phi_deid" type="checkbox" checked><label for="phi_deid">Enable Azure Health Data Services (DICOM + De-id)</label></div>
+      </fieldset>
+
+      <fieldset><legend>Compute</legend>
+        <div class="calc-row"><label for="sku">Endpoint SKU</label><select id="sku"></select></div>
+        <div class="calc-row"><label for="instance_count">Instance count (steady state)</label><input id="instance_count" type="number" min="1" value="1"></div>
+        <div class="calc-row"><label for="autoscale_max">Autoscale max</label><input id="autoscale_max" type="number" min="1" value="3"></div>
+        <div class="calc-row"><label for="p95_latency_ms">Target P95 latency (ms)</label><input id="p95_latency_ms" type="number" min="500" value="4000"></div>
+        <div class="calc-row"><label for="target_throughput">Target throughput (req/min)</label><input id="target_throughput" type="number" min="0" value="12"></div>
+        <div class="calc-row"><label for="reservation">Reservation</label><select id="reservation"></select></div>
+        <div class="calc-row"><label for="hours_month">Hours per month (730 = always-on)</label><input id="hours_month" type="number" min="0" max="744" value="730"></div>
+      </fieldset>
+
+      <fieldset><legend>Networking</legend>
+        <div class="calc-row"><label for="pe_count">Private endpoint count</label><input id="pe_count" type="number" min="0" value="8"></div>
+        <div class="calc-row"><label for="egress_gb">Egress (GB / month)</label><input id="egress_gb" type="number" min="0" value="100"></div>
+        <div class="calc-row inline"><input id="expressroute" type="checkbox"><label for="expressroute">ExpressRoute port + circuit</label></div>
+      </fieldset>
+
+      <fieldset><legend>Foundry add-ons</legend>
+        <div class="calc-row inline"><input id="foundry_addons" type="checkbox"><label for="foundry_addons">Enable add-ons</label></div>
+        <div class="calc-row"><label for="aisearch_tier">Azure AI Search tier</label><select id="aisearch_tier"></select></div>
+        <div class="calc-row"><label for="cosmos_rus">Cosmos DB RU/s (autoscale)</label><input id="cosmos_rus" type="number" min="0" value="1000"></div>
+        <div class="calc-row"><label for="la_gb_day">Log Analytics + App Insights (GB/day)</label><input id="la_gb_day" type="number" min="0" step="0.1" value="5"></div>
+      </fieldset>
+
+      <fieldset><legend>Support &amp; security</legend>
+        <div class="calc-row"><label for="support_plan">Support plan</label><select id="support_plan"></select></div>
+        <div class="calc-row inline"><input id="defender" type="checkbox" checked><label for="defender">Microsoft Defender for Cloud</label></div>
+      </fieldset>
+    </form>
+
+    <aside class="calc-results">
+      <div class="calc-total">
+        <div><span class="sub">Monthly total</span><div class="big" id="total-monthly">$0.00</div></div>
+        <div><span class="sub">Annual</span> <strong id="total-annual">$0.00</strong></div>
+        <div><span class="sub">Cost / study</span> <strong id="cost-per-study">$0.00</strong></div>
+        <div><span class="sub">Cost / 1k inferences</span> <strong id="cost-per-1k">$0.00</strong></div>
+        <div><span class="sub">Recommended instances for throughput</span> <strong id="recommended-instances">1</strong></div>
+        <div><span class="sub">New stored data / month (GB)</span> <strong id="new-data-gb">0</strong></div>
+      </div>
+
+      <table>
+        <thead><tr><th>Line item</th><th class="num">Monthly</th></tr></thead>
+        <tbody id="lines-body"></tbody>
+      </table>
+
+      <h3>Sensitivity</h3>
+      <div class="sensitivity-grid" id="sensitivity"></div>
+
+      <div class="calc-actions">
+        <button class="btn" id="btn-csv" type="button">Download CSV</button>
+        <button class="btn btn--ghost" id="btn-md" type="button">Copy as Markdown</button>
+        <button class="btn btn--ghost" id="btn-reload-pricing" type="button">Reload pricing.json</button>
+        <button class="btn btn--ghost" id="btn-reset" type="button">Reset</button>
+      </div>
+      <p style="margin-top:1rem;font-size:.8rem;color:var(--fg-muted)">
+        Estimates only. Always validate against the official
+        <a href="https://azure.microsoft.com/pricing/calculator/" target="_blank" rel="noopener">Azure Pricing Calculator</a>.
+        Update <a href="assets/data/pricing.json">pricing.json</a> quarterly — see
+        <a href="pricing-schema.md">pricing-schema.md</a>.
+      </p>
+    </aside>
+  </div>
+</section>
+
+<!-- =================== Ops =================== -->
+<section class="tab-panel" id="tab-ops" role="tabpanel" aria-labelledby="tabbtn-ops" tabindex="-1">
+  <h1>Monitoring &amp; Ops</h1>
+
+  <h2>SLOs to set</h2>
+  <ul>
+    <li><strong>Availability:</strong> 99.5% monthly (single region, single instance) → 99.9% with 2+ instances across zones.</li>
+    <li><strong>P95 latency:</strong> &lt; 5s end-to-end including PNG conversion.</li>
+    <li><strong>Throughput:</strong> ~12 req/min per A100 instance (model-dependent — measure your own).</li>
+  </ul>
+
+  <h2>App Insights KQL — copy/paste</h2>
+<pre><code class="language-kql">// Request volume + latency
+requests
+| where cloud_RoleName has "cxrreportgen"
+| summarize cnt = count(), p50 = percentile(duration, 50), p95 = percentile(duration, 95)
+  by bin(timestamp, 5m)
+| render timechart
+</code></pre>
+<pre><code class="language-kql">// Error breakdown
+requests
+| where success == false
+| summarize cnt = count() by resultCode, operation_Name
+| top 20 by cnt desc
+</code></pre>
+<pre><code class="language-kql">// Custom finding-count metric (emit from your scoring wrapper)
+customMetrics
+| where name == "findings_per_study"
+| summarize avg = avg(value), p95 = percentile(value, 95) by bin(timestamp, 1h)
+</code></pre>
+
+  <h2>Autoscale</h2>
+<pre><code class="language-bash">az monitor autoscale create \
+  --resource-group RG --name cxr-autoscale \
+  --resource /subscriptions/.../onlineEndpoints/cxrreportgen-endpoint/deployments/cxr-v1 \
+  --min-count 1 --max-count 3 --count 1
+
+az monitor autoscale rule create -g RG --autoscale-name cxr-autoscale \
+  --condition "GpuUtilizationPercentage &gt; 75 avg 5m" --scale out 1
+
+az monitor autoscale rule create -g RG --autoscale-name cxr-autoscale \
+  --condition "DeploymentLogPipelineSuccessRate &lt; 99 avg 5m" --scale out 1
+</code></pre>
+
+  <h2>Blue/green deployments</h2>
+  <ul>
+    <li>Deploy <code>cxr-v2</code> alongside <code>cxr-v1</code> on the same endpoint.</li>
+    <li>Shift 10% traffic: <code>az ml online-endpoint update --traffic "cxr-v1=90 cxr-v2=10"</code>.</li>
+    <li>Monitor for 24h. If clean, ramp to 100%.</li>
+    <li>Rollback = single command — flip traffic back.</li>
+  </ul>
+
+  <h2>Drift &amp; retraining</h2>
+  <ul>
+    <li>Sample 1% of requests + outputs to a <em>shadow store</em> (with patient consent).</li>
+    <li>Weekly: compute finding-distribution drift vs. baseline.</li>
+    <li>Trigger retraining when KS-statistic exceeds threshold — see the MI2 adapter-training notebook for the fine-tuning loop.</li>
+  </ul>
+
+  <h2>Cost guardrails</h2>
+  <ul>
+    <li>Subscription budgets with email + Logic App actions at 50/80/100%.</li>
+    <li>Cost anomaly alert on the resource group.</li>
+    <li>Schedule <code>az ml online-deployment update --instance-count 0</code> for non-prod endpoints overnight (A100s can't scale-to-zero).</li>
+  </ul>
+</section>
+
+<!-- =================== Troubleshooting =================== -->
+<section class="tab-panel" id="tab-troubleshooting" role="tabpanel" aria-labelledby="tabbtn-troubleshooting" tabindex="-1">
+  <h1>Troubleshooting</h1>
+
+  <h2>Quota errors</h2>
+  <div class="callout callout--danger"><code>OutOfQuota: Not enough quota available for SKU Standard_NC24ads_A100_v4.</code></div>
+  <p>Request 29+ vCPU (24 + 20%). For autoscale max=3, request 87 vCPU.</p>
+
+  <h2>Image pull failures</h2>
+  <ul>
+    <li>Check the workspace's ACR is private-endpoint-reachable from the deployment subnet.</li>
+    <li>If the ACR is in another VNet, peer them and add the <code>privatelink.azurecr.io</code> DNS zone.</li>
+    <li>Tail the deployment log: <code>az ml online-deployment get-logs -n cxr-v1 -e &lt;ep&gt;</code>.</li>
+  </ul>
+
+  <h2>OOM on smaller SKUs</h2>
+  <p>CXRReportGen needs ~50 GB GPU memory. Anything below A100 80GB (e.g. A10) will OOM at load time.</p>
+
+  <h2>Request timeouts</h2>
+  <p>Default is 90s. If you see <code>504</code> with cold-start patterns, raise to 120s and warm with a keep-alive ping every 4 min.</p>
+
+  <h2>Black or inverted images</h2>
+  <ul>
+    <li>Missing VOI LUT → image looks black. Apply <code>pydicom.pixel_data_handlers.util.apply_voi_lut</code>.</li>
+    <li>MONOCHROME1 not inverted → lungs look white, bones black. Invert.</li>
+    <li>Wrong endianness on multi-frame DICOM → noise pattern. Use SimpleITK / fo-dicom rather than hand-parsing.</li>
+  </ul>
+
+  <h2>Bounding boxes are off</h2>
+  <p>You didn't rescale from the center-cropped square back to original dimensions. See <a href="#tab=test">Test the Endpoint → Python invocation</a>.</p>
+
+  <h2>App Insights "no data"</h2>
+  <ul>
+    <li>Confirm <code>app_insights_enabled=True</code> on the deployment.</li>
+    <li>Check the workspace's linked App Insights resource is in the same region.</li>
+    <li>Outbound 443 to <code>dc.applicationinsights.azure.com</code> must be open from the deployment subnet.</li>
+  </ul>
+
+  <h2>Endpoint stuck "Provisioning"</h2>
+  <ul>
+    <li>Run <code>az ml online-deployment get-logs</code> — image build vs. model download vs. probe failure is in the first 200 lines.</li>
+    <li>Increase <code>liveness_probe.initial_delay</code> to 600s for first deploys (model download is large).</li>
+  </ul>
+</section>
+
+<!-- =================== References =================== -->
+<section class="tab-panel" id="tab-references" role="tabpanel" aria-labelledby="tabbtn-references" tabindex="-1">
+  <h1>References</h1>
+  <p class="lede">All links verified <strong>2026-05-27</strong>.</p>
+
+  <h2>Microsoft Learn</h2>
+  <ul>
+    <li><a href="https://learn.microsoft.com/azure/developer/azure-developer-cli/azure-ai-ml-endpoints">azd: Deploy to a Microsoft Foundry or Azure ML online endpoint</a></li>
+    <li><a href="https://learn.microsoft.com/azure/machine-learning/how-to-deploy-online-endpoints">Deploy and score a model with an online endpoint</a></li>
+    <li><a href="https://learn.microsoft.com/azure/machine-learning/concept-endpoints-online">Concept: online endpoints</a></li>
+    <li><a href="https://learn.microsoft.com/azure/machine-learning/how-to-manage-quotas">Manage quotas (including +20% upgrade reservation)</a></li>
+    <li><a href="https://learn.microsoft.com/azure/machine-learning/how-to-secure-online-endpoint">Secure online endpoints with managed VNet</a></li>
+    <li><a href="https://learn.microsoft.com/azure/healthcare-apis/dicom/dicom-services-overview">Azure Health Data Services — DICOM service</a></li>
+    <li><a href="https://learn.microsoft.com/azure/healthcare-apis/deidentification/overview">Azure Health Data Services — De-identification service</a></li>
+    <li><a href="https://azure.microsoft.com/pricing/calculator/">Official Azure Pricing Calculator</a></li>
+  </ul>
+
+  <h2>Microsoft GitHub</h2>
+  <ul>
+    <li><a href="https://github.com/microsoft/healthcareai-examples">microsoft/healthcareai-examples</a></li>
+    <li><a href="https://github.com/microsoft/healthcareai-examples/blob/main/azureml/medimageinsight/adapter-training.ipynb">MI2 adapter-training (DICOM ingestion pattern)</a></li>
+    <li><a href="https://github.com/Azure/azureml-examples/blob/main/sdk/python/foundation-models/healthcare-ai/cxrreportgen/cxr-deploy.ipynb">azureml-examples: cxr-deploy.ipynb</a></li>
+    <li><a href="https://microsoft.github.io/healthcareai-examples/">Healthcare AI Examples site</a></li>
+    <li><a href="https://github.com/MicrosoftDocs/azure-dev-docs/blob/main/articles/azure-developer-cli/azure-ai-ml-endpoints.md">Source: azure-dev-docs azd article</a></li>
+    <li><a href="https://github.com/MicrosoftDocs/azure-ai-docs/blob/main/articles/machine-learning/how-to-deploy-online-endpoints.md">Source: azure-ai-docs deploy article</a></li>
+  </ul>
+
+  <h2>Background reading</h2>
+  <ul>
+    <li><a href="https://techcommunity.microsoft.com/blog/healthcareandlifesciencesblog/unlocking-the-magic-of-embedding-models-practical-patterns-for-healthcare-ai/4358000">Unlocking the magic of embedding models — HLS blog</a></li>
+    <li><a href="https://techcommunity.microsoft.com/blog/healthcareandlifesciencesblog/image-search-series-part-1-chest-x-ray-lookup-with-medimageinsight/4372736">Image Search Pt. 1 — Chest X-Ray lookup with MedImageInsight</a></li>
+  </ul>
+
+  <h2>Site source</h2>
+  <p><a href="https://github.com/patmeh1/cxrreportgen-deploy-guide">github.com/patmeh1/cxrreportgen-deploy-guide</a> — issues + PRs welcome.</p>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <p>Research only — not for clinical use. Built by <a href="https://github.com/patmeh1">@patmeh1</a>. MIT-licensed.</p>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-csharp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js" defer></script>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  document.querySelectorAll('pre > code.language-mermaid').forEach(c => {
+    const div = document.createElement('div'); div.className = 'mermaid'; div.textContent = c.textContent;
+    c.parentElement.replaceWith(div);
+  });
+  mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'strict' });
+</script>
+<script src="assets/js/tabs.js" defer></script>
+<script src="assets/js/calculator.js" defer></script>
+<script>
+  // Region matrix
+  fetch('assets/data/region-availability.json').then(r => r.json()).then(j => {
+    const rows = Object.entries(j.foundry_available).map(([id, foundry]) => {
+      const tr = document.createElement('tr');
+      const cell = (v) => `<td>${v ? '✓' : '✗'}</td>`;
+      tr.innerHTML = `<td>${id}</td>${cell(j.sku_availability.Standard_NC24ads_A100_v4[id])}${cell(j.sku_availability.Standard_NC48ads_A100_v4[id])}${cell(j.sku_availability.Standard_NC96ads_A100_v4[id])}${cell(foundry)}`;
+      return tr;
+    });
+    const tbody = document.getElementById('region-matrix');
+    tbody.innerHTML = ''; rows.forEach(r => tbody.appendChild(r));
+  });
+</script>
+</body>
+</html>
+

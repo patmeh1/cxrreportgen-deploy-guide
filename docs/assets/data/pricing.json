@@ -1,0 +1,67 @@
+{
+  "_meta": {
+    "currency": "USD",
+    "last_verified": "2026-05-27",
+    "source": "Placeholder rates. Validate against https://azure.microsoft.com/pricing/calculator/ before quoting customers.",
+    "schema_version": "1.0.0"
+  },
+  "regions": {
+    "eastus":         { "label": "East US",         "modifier": 1.00 },
+    "eastus2":        { "label": "East US 2",       "modifier": 1.00 },
+    "westus3":        { "label": "West US 3",       "modifier": 1.02 },
+    "northeurope":    { "label": "North Europe",    "modifier": 1.05 },
+    "westeurope":     { "label": "West Europe",     "modifier": 1.07 },
+    "uksouth":        { "label": "UK South",        "modifier": 1.08 },
+    "australiaeast":  { "label": "Australia East",  "modifier": 1.12 },
+    "swedencentral":  { "label": "Sweden Central",  "modifier": 1.06 }
+  },
+  "compute_hourly": {
+    "Standard_NC24ads_A100_v4": 3.67,
+    "Standard_NC48ads_A100_v4": 7.34,
+    "Standard_NC96ads_A100_v4": 14.69
+  },
+  "reservation_discount": { "none": 0.00, "1yr": 0.31, "3yr": 0.55 },
+  "requests_per_instance_per_minute": 12,
+  "storage_per_gb_month": {
+    "hot": 0.0184,
+    "cool": 0.0100,
+    "archive": 0.00099,
+    "transactions_per_10k": 0.0050
+  },
+  "networking": {
+    "private_endpoint_hour": 0.010,
+    "egress_per_gb": 0.087,
+    "expressroute_port_month": 252.00,
+    "expressroute_circuit_month": 300.00
+  },
+  "acr_standard_month": 20.00,
+  "key_vault_per_10k_ops": 0.03,
+  "app_insights_per_gb": 2.30,
+  "log_analytics_per_gb": 2.76,
+  "ai_search": {
+    "basic_month": 73.73,
+    "s1_month": 245.81,
+    "s2_month": 983.23
+  },
+  "cosmos_db": {
+    "ru_per_100_per_hour": 0.008,
+    "storage_per_gb_month": 0.25
+  },
+  "azure_health_data_services": {
+    "dicom_storage_per_gb_month": 0.107,
+    "dicom_per_10k_transactions": 0.50,
+    "deid_per_instance_hour": 1.20
+  },
+  "container_apps": {
+    "vcpu_second": 0.000024,
+    "memory_gib_second": 0.0000025,
+    "request_per_million": 0.40
+  },
+  "support_plan_month": {
+    "none": 0,
+    "developer": 29,
+    "standard": 100,
+    "pro_direct": 1000
+  },
+  "defender_for_cloud_per_resource_month": 15.00
+}

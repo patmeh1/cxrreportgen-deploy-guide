@@ -1,0 +1,28 @@
+{
+  "_meta": {
+    "last_verified": "2026-05-27",
+    "note": "Verify in the Azure portal — Quotas → Compute → request — before committing to a region."
+  },
+  "sku_availability": {
+    "Standard_NC24ads_A100_v4": {
+      "eastus": true, "eastus2": true, "westus3": true,
+      "northeurope": true, "westeurope": true,
+      "uksouth": true, "australiaeast": false, "swedencentral": true
+    },
+    "Standard_NC48ads_A100_v4": {
+      "eastus": true, "eastus2": true, "westus3": true,
+      "northeurope": true, "westeurope": true,
+      "uksouth": false, "australiaeast": false, "swedencentral": true
+    },
+    "Standard_NC96ads_A100_v4": {
+      "eastus": true, "eastus2": true, "westus3": true,
+      "northeurope": false, "westeurope": true,
+      "uksouth": false, "australiaeast": false, "swedencentral": true
+    }
+  },
+  "foundry_available": {
+    "eastus": true, "eastus2": true, "westus3": true,
+    "northeurope": true, "westeurope": true,
+    "uksouth": true, "australiaeast": true, "swedencentral": true
+  }
+}

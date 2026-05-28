@@ -1,0 +1,12 @@
+name: cxrreportgen-azd
+metadata:
+  template: cxrreportgen-azd@1.0.0
+services:
+  cxr:
+    host: ai.endpoint
+    config:
+      workspace: ${AZUREAI_PROJECT_NAME}
+      deployment:
+        path: ./deployment.yml
+        environment:
+          PRT_CONFIG_OVERRIDE: deployment.subscription_id=${AZURE_SUBSCRIPTION_ID},deployment.resource_group=${AZURE_RESOURCE_GROUP},deployment.workspace_name=${AZUREAI_PROJECT_NAME},deployment.endpoint_name=${AZUREAI_ENDPOINT_NAME},deployment.deployment_name=${AZUREAI_DEPLOYMENT_NAME}

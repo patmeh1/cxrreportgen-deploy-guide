@@ -1,0 +1,8 @@
+$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineEndpoint.schema.json
+name: cxrreportgen-endpoint
+auth_mode: key
+description: Managed online endpoint for Microsoft CxrReportGen (chest X-ray report generation).
+tags:
+  workload: healthcare-ai
+  model: CxrReportGen
+  phi: "false"
