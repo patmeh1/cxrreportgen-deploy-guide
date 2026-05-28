@@ -129,8 +129,17 @@
   });
 
   // Deep link
-  const fromHash = (location.hash.match(/tab=([\w-]+)/) || [])[1];
+  function tabFromHash() {
+    return (location.hash.match(/tab=([\w-]+)/) || [])[1];
+  }
+  const fromHash = tabFromHash();
   show(fromHash && document.getElementById('tab-' + fromHash) ? fromHash : 'overview', false);
+
+  // In-page <a href="#tab=X"> links + browser back/forward
+  window.addEventListener('hashchange', () => {
+    const id = tabFromHash();
+    if (id && document.getElementById('tab-' + id)) show(id, false);
+  });
 
   // Theme toggle
   const themeBtn = document.getElementById('theme-toggle');
