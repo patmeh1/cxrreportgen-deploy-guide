@@ -29,6 +29,7 @@
 <nav class="tab-nav" role="tablist" aria-label="Guide sections">
   <div class="tab-nav-inner">
     <button class="tab-button" role="tab" data-tab="overview"        aria-controls="tab-overview"        id="tabbtn-overview">Overview</button>
+    <button class="tab-button" role="tab" data-tab="walkthrough"     aria-controls="tab-walkthrough"     id="tabbtn-walkthrough">End-to-End Walkthrough</button>
     <button class="tab-button" role="tab" data-tab="prereqs"         aria-controls="tab-prereqs"         id="tabbtn-prereqs">Prerequisites</button>
     <button class="tab-button" role="tab" data-tab="architecture"    aria-controls="tab-architecture"    id="tabbtn-architecture">Architecture</button>
     <button class="tab-button" role="tab" data-tab="dicom"           aria-controls="tab-dicom"           id="tabbtn-dicom">DICOM Ingestion</button>
@@ -46,6 +47,7 @@
   <label for="tab-select" class="visually-hidden">Section</label>
   <select id="tab-select" aria-label="Jump to section">
     <option value="overview">Overview</option>
+    <option value="walkthrough">End-to-End Walkthrough</option>
     <option value="prereqs">Prerequisites</option>
     <option value="architecture">Architecture</option>
     <option value="dicom">DICOM Ingestion</option>
@@ -113,6 +115,270 @@ ml.online_deployments.begin_create_or_update(ManagedOnlineDeployment(
     app_insights_enabled=True,
 )).result()
 </code></pre>
+</section>
+
+<!-- =================== End-to-End Walkthrough =================== -->
+<section class="tab-panel" id="tab-walkthrough" role="tabpanel" aria-labelledby="tabbtn-walkthrough" tabindex="-1">
+  <h1>End-to-End Walkthrough — from empty subscription to rendered report</h1>
+  <p class="lede">Sixteen sequential steps. Total active work ~1 hour, plus 20–40 min wait for the deployment to roll out. Expected one-time cost: <strong>under $10</strong> if you delete the endpoint at the end (one A100 hour ≈ $3.67 + ~$2 in workspace dependencies).</p>
+
+  <div class="callout callout--info">
+    <strong>What you'll have at the end.</strong> A live managed online endpoint serving CXRReportGen, a Python environment that can feed it real DICOM files, and a structured radiology report (JSON + Markdown + overlay PNG) generated from your own chest X-ray study.
+  </div>
+
+  <h2>The journey at a glance</h2>
+<pre><code class="language-mermaid">sequenceDiagram
+  autonumber
+  participant U as You (laptop)
+  participant CLI as az / Python
+  participant ARM as Azure Resource Manager
+  participant W as AML Workspace + deps
+  participant R as azureml system registry
+  participant EP as Managed Online Endpoint (A100)
+  U->>CLI: az login + set subscription
+  U->>ARM: az group create
+  U->>ARM: check / request A100 quota
+  ARM->>W: az ml workspace create (storage, KV, ACR, App Insights)
+  U->>R: MLClient(registry_name="azureml").models.get("CxrReportGen")
+  U->>EP: create endpoint + deployment (A100, 1 instance)
+  Note over EP: 20–40 min provisioning
+  U->>EP: invoke (toolkit passes .dcm directly)
+  EP-->>U: findings + bounding boxes
+  U->>U: render report (Markdown + overlay PNG)
+</code></pre>
+
+  <h2>Step 0 — Decide on names + region <span class="muted">(5 min)</span></h2>
+  <p>Pick a region where both the A100 v4 SKU and the model are available — East US, East US 2, West US 3, or Sweden Central are safe defaults. See the <a href="#tab=prereqs">Prerequisites tab</a> for the full region matrix.</p>
+<pre><code class="language-bash"># Export these and reuse for the rest of the walkthrough
+export SUB="00000000-0000-0000-0000-000000000000"   # your subscription id
+export LOC="eastus"
+export RG="cxr-rg"
+export WS="cxr-mlw"
+export EP="cxr-endpoint-001"
+export DEP="cxr-v1"
+</code></pre>
+
+  <h2>Step 1 — Install tooling <span class="muted">(10 min)</span></h2>
+<pre><code class="language-bash"># Azure CLI + ML extension
+brew install azure-cli            # macOS — or use the MS installer on Win/Linux
+az extension add -n ml --upgrade
+
+# Python 3.10+ in a fresh venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install azure-ai-ml azure-identity pydicom pillow matplotlib numpy
+pip install "healthcareai_toolkit @ git+https://github.com/microsoft/healthcareai-examples.git#subdirectory=package"
+</code></pre>
+
+  <h2>Step 2 — Sign in + select subscription <span class="muted">(2 min)</span></h2>
+<pre><code class="language-bash">az login                 # interactive browser flow
+az account set -s "$SUB"
+az account show --query "{name:name, id:id, tenantId:tenantId}" -o table
+</code></pre>
+
+  <h2>Step 3 — Create the resource group <span class="muted">(30 s)</span></h2>
+<pre><code class="language-bash">az group create -n "$RG" -l "$LOC" --tags purpose=cxrreportgen owner="$USER"
+</code></pre>
+
+  <h2>Step 4 — Verify (or request) A100 quota <span class="muted">(2 min — up to 24 h if increase needed)</span></h2>
+  <p>AML reserves an additional ~20% of cores for rolling upgrades, so a 24-vCPU SKU requires <strong>≥29 vCPU</strong> of <code>StandardNCADSA100v4Family</code> quota to deploy a single instance.</p>
+<pre><code class="language-bash">az ml quota list -l "$LOC" --query "[?contains(name.value, 'NCADSA100v4')]" -o table
+# If "limit" is 0 or &lt;29, file a quota increase:
+#   Portal &rarr; Subscriptions &rarr; Usage + quotas &rarr; Request increase
+#   Provider: Machine Learning &rarr; Family: StandardNCADSA100v4Family &rarr; Region: $LOC
+</code></pre>
+
+  <h2>Step 5 — Create the Azure ML workspace <span class="muted">(3–5 min)</span></h2>
+  <p>One command creates the workspace and auto-provisions a storage account, Key Vault, App Insights, and (on first deployment) an Azure Container Registry.</p>
+<pre><code class="language-bash">az ml workspace create -g "$RG" -n "$WS" -l "$LOC"
+
+# Drop a config.json next to your notebooks so MLClient.from_config() works:
+cat &gt; config.json &lt;&lt;EOF
+{
+  "subscription_id": "$SUB",
+  "resource_group": "$RG",
+  "workspace_name": "$WS"
+}
+EOF
+</code></pre>
+  <div class="callout callout--info">
+    Prefer <strong>Microsoft Foundry</strong>? Pass <code>--kind hub</code> and create a project under it. The remaining steps are identical — the <code>azureml</code> system registry and the <code>CxrReportGen</code> model are the same. See the <a href="#tab=deploy">Deploy tab → azd path</a> for a fully IaC variant.
+  </div>
+
+  <h2>Step 6 — Resolve the model from the system registry <span class="muted">(10 s)</span></h2>
+<pre><code class="language-python">from azure.ai.ml import MLClient
+from azure.identity import DefaultAzureCredential
+
+cred = DefaultAzureCredential()
+registry = MLClient(cred, registry_name="azureml")
+model = registry.models.get(name="CxrReportGen", label="latest")
+print(f"{model.name}  version={model.version}  id={model.id}")
+</code></pre>
+
+  <h2>Step 7 — Create the endpoint <span class="muted">(2 min)</span></h2>
+<pre><code class="language-python">from azure.ai.ml.entities import ManagedOnlineEndpoint
+ml = MLClient.from_config(cred)
+
+endpoint = ManagedOnlineEndpoint(
+    name="cxr-endpoint-001",
+    description="CXRReportGen — walkthrough",
+    auth_mode="key",   # use "aad_token" if you're inside a private network
+)
+ml.online_endpoints.begin_create_or_update(endpoint).result()
+</code></pre>
+
+  <h2>Step 8 — Create the A100 deployment <span class="muted">(20–40 min — set a timer)</span></h2>
+<pre><code class="language-python">from azure.ai.ml.entities import ManagedOnlineDeployment, OnlineRequestSettings
+
+deployment = ManagedOnlineDeployment(
+    name="cxr-v1",
+    endpoint_name="cxr-endpoint-001",
+    model=model,
+    instance_type="Standard_NC24ads_A100_v4",   # required SKU
+    instance_count=1,
+    request_settings=OnlineRequestSettings(request_timeout_ms=90000),
+    app_insights_enabled=True,
+)
+ml.online_deployments.begin_create_or_update(deployment).result()
+
+# Route 100% of traffic to the new deployment
+endpoint = ml.online_endpoints.get("cxr-endpoint-001")
+endpoint.traffic = {"cxr-v1": 100}
+ml.online_endpoints.begin_create_or_update(endpoint).result()
+</code></pre>
+  <div class="callout callout--warn">
+    The provisioning state goes through <code>Creating &rarr; Updating &rarr; Succeeded</code>. If it lands on <code>Failed</code>, jump to the <a href="#tab=troubleshooting">Troubleshooting tab</a> — 9 times out of 10 it's quota or container-image pull.
+  </div>
+
+  <h2>Step 9 — Capture the scoring URI + key <span class="muted">(10 s)</span></h2>
+<pre><code class="language-bash">export SCORING_URI=$(az ml online-endpoint show -n "$EP" --query scoring_uri -o tsv)
+export SCORING_KEY=$(az ml online-endpoint get-credentials -n "$EP" --query primaryKey -o tsv)
+echo "URI: $SCORING_URI"
+</code></pre>
+
+  <h2>Step 10 — Download the official sample images <span class="muted">(1 min)</span></h2>
+<pre><code class="language-bash"># azcopy is the canonical path; az storage blob download-batch also works
+azcopy copy --recursive \
+  "https://azuremlexampledata.blob.core.windows.net/data/healthcare-ai/cxrreportgen-images/*" \
+  ./images
+</code></pre>
+
+  <h2>Step 11 — Smoke-test with the toolkit one-liner <span class="muted">(30 s)</span></h2>
+<pre><code class="language-python">from healthcareai_toolkit.clients import CxrReportGenClient
+
+client = CxrReportGenClient(endpoint_name="cxr-endpoint-001")
+result = client.submit(
+    frontal_image="./images/cxr_frontal.jpg",
+    lateral_image="./images/cxr_lateral.jpg",
+    indication="",
+    technique="",
+    comparison="None",
+)
+for finding, boxes in result[0]["output"]:
+    print(("*" if boxes else " "), finding)
+</code></pre>
+  <p>Expected — the same five findings the sample notebook prints. If you see them, the deployment is healthy.</p>
+
+  <h2>Step 12 — Run inference on your own DICOM <span class="muted">(varies)</span></h2>
+  <p>The toolkit accepts <code>.dcm</code> directly. It reads the pixel data via SimpleITK, applies 1st/99th-percentile windowing, converts to uint8, encodes a PNG, and base64-encodes the payload — see the <a href="#tab=dicom">DICOM Ingestion tab</a> for the full source-level walkthrough.</p>
+<pre><code class="language-python">from healthcareai_toolkit.clients import CxrReportGenClient
+
+client = CxrReportGenClient(endpoint_name="cxr-endpoint-001")
+result = client.submit(
+    frontal_image="my_study/frontal.dcm",
+    lateral_image="my_study/lateral.dcm",
+    indication="65F, shortness of breath x 3 days",
+    technique="PA and lateral chest radiograph",
+    comparison="None",
+    # Optional prior study for change detection:
+    # prior_image="prior_study/frontal.dcm",
+    # prior_report="Stable cardiomegaly. No effusion.",
+)
+findings = result[0]["output"]
+</code></pre>
+
+  <h2>Step 13 — Render the final report <span class="muted">(2 min)</span></h2>
+  <p>Pull together the three deliverables a radiology workflow expects: a structured JSON record, a Markdown-rendered report, and an overlay PNG with the bounding boxes drawn back in <em>original DICOM pixel space</em>.</p>
+<pre><code class="language-bash">python make_report.py \
+  --frontal my_study/frontal.dcm \
+  --lateral my_study/lateral.dcm \
+  --findings findings.json \
+  --out-dir reports/study-001
+# Writes:  reports/study-001/report.json
+#          reports/study-001/report.md
+#          reports/study-001/frontal_overlay.png
+</code></pre>
+  <p>Source: <a href="assets/samples/make_report.py">make_report.py</a> — uses <code>pydicom</code>, <code>Pillow</code>, and <code>matplotlib</code>; no extra deps beyond what you installed in Step 1.</p>
+
+  <h3>Example final report (Markdown render)</h3>
+<pre><code class="language-markdown"># Chest X-ray report — study-001
+
+**Patient:** [redacted]  &nbsp; **Acquired:** 2026-05-27 14:32 UTC
+**Indication:** 65F, shortness of breath x 3 days
+**Technique:** PA and lateral chest radiograph
+**Comparison:** None
+
+## Findings
+
+1. The heart size is normal.
+2. The aorta is tortuous. *(localized — frontal)*
+3. A patchy infiltrate in the right lower lobe is associated with volume loss. *(localized — frontal)*
+4. A small right pleural effusion is present. *(localized — frontal)*
+5. The left hemithorax is grossly clear.
+
+![Frontal overlay](frontal_overlay.png)
+
+---
+*Generated by CXRReportGen on cxr-endpoint-001 — research use only. Not for clinical diagnosis.*
+</code></pre>
+
+  <h3>Example structured JSON</h3>
+<pre><code class="language-json">{
+  "study_id": "study-001",
+  "model": { "name": "CxrReportGen", "endpoint": "cxr-endpoint-001", "version": "v440" },
+  "inputs": {
+    "indication": "65F, shortness of breath x 3 days",
+    "technique": "PA and lateral chest radiograph",
+    "comparison": "None"
+  },
+  "findings": [
+    { "text": "The heart size is normal.", "boxes_original": [] },
+    { "text": "The aorta is tortuous.",
+      "boxes_original": [[850, 510, 1300, 1720]] },
+    { "text": "A patchy infiltrate in the right lower lobe is associated with volume loss.",
+      "boxes_original": [[240, 1010, 920, 1810]] },
+    { "text": "A small right pleural effusion is present.",
+      "boxes_original": [[240, 1260, 880, 1920]] },
+    { "text": "The left hemithorax is grossly clear.", "boxes_original": [] }
+  ],
+  "generated_at": "2026-05-27T14:32:11Z"
+}
+</code></pre>
+  <p>The <code>boxes_original</code> coordinates are already rescaled from the model's center-cropped square back to the original DICOM pixel dimensions — see <a href="#tab=test">Test the Endpoint</a> for the rescale function. Drop the JSON into a FHIR <code>DiagnosticReport</code> resource (see the <a href="#tab=dicom">DICOM tab</a>) to write it back to your EHR.</p>
+
+  <h2>Step 14 — Sanity check the cost <span class="muted">(1 min)</span></h2>
+  <p>Open the <a href="#tab=cost-calculator">Cost Calculator</a> with your daily study volume, retention policy, and region. For a single-instance East US deployment running 24×7, expect ~$2,700–$3,200/month before storage and AHDS.</p>
+
+  <h2>Step 15 — Production hardening <span class="muted">(separate workstreams)</span></h2>
+  <p>Before this serves real workloads, walk these tabs:</p>
+  <ul>
+    <li><a href="#tab=networking">Networking &amp; Security</a> — managed VNet, private endpoint, NSG, ExpressRoute.</li>
+    <li><a href="#tab=compliance">Compliance &amp; RAI</a> — PHI scrub, HIPAA BAA, data residency, model-card disclosure.</li>
+    <li><a href="#tab=ops">Monitoring &amp; Ops</a> — App Insights dashboards, autoscale rules, blue/green rollouts.</li>
+    <li><a href="#tab=dicom">DICOM Ingestion</a> — PACS / DICOMweb / FHIR write-back wiring.</li>
+  </ul>
+
+  <h2>Step 16 — Clean up <span class="muted">(30 s — do this when you're done experimenting!)</span></h2>
+<pre><code class="language-bash"># Stop the meter on the A100 (workspace + storage stay)
+az ml online-endpoint delete -n "$EP" -y
+
+# Or nuke everything in the resource group
+az group delete -n "$RG" -y --no-wait
+</code></pre>
+
+  <div class="callout callout--danger">
+    <strong>Don't leave the deployment running by accident.</strong> An idle A100 still bills full price — about $88/day, $2,700/month. Set a <a href="https://learn.microsoft.com/azure/cost-management-billing/costs/cost-mgt-alerts-monitor-usage-spending">budget alert</a> on the resource group as a safety net.
+  </div>
 </section>
 
 <!-- =================== Prerequisites =================== -->
@@ -899,6 +1165,7 @@ az monitor autoscale rule create -g RG --autoscale-name cxr-autoscale \
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-csharp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markdown.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js" defer></script>
 <script type="module">
   import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';

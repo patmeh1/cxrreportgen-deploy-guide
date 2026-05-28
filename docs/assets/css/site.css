@@ -344,3 +344,9 @@ pre:hover .copy-btn, .copy-btn:focus-visible { opacity: 1; }
   z-index: 1000;
 }
 .skip-link:focus { left: 0; }
+
+.muted {
+  color: var(--fg-muted);
+  font-weight: 400;
+  font-size: 0.85em;
+}

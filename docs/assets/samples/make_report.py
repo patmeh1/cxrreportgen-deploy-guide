@@ -1,0 +1,176 @@
+"""
+make_report.py — Render a CXRReportGen response into a clinical-style report.
+
+Inputs:
+    --frontal  path to the FRONTAL DICOM (.dcm) or PNG/JPG used at inference
+    --lateral  optional path to the LATERAL image (same format)
+    --findings path to the raw findings JSON saved from
+                 result[0]["output"] returned by CxrReportGenClient.submit(...)
+    --out-dir  output directory (created if missing)
+
+Outputs (written into --out-dir):
+    report.json            structured record with bboxes rescaled to original DICOM pixels
+    report.md              Markdown-formatted radiology-style report
+    frontal_overlay.png    frontal image with bounding boxes drawn back in original pixel space
+
+This is the same "final report" path documented in the End-to-End Walkthrough tab
+of the CXRReportGen deployment guide. Research use only — not for clinical diagnosis.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+
+
+def _pil_for_render(path: Path) -> Image.Image:
+    """Load any frontal/lateral asset (DICOM or standard image) as 8-bit grayscale PIL."""
+    if path.suffix.lower() in {".dcm", ".dicom"}:
+        import pydicom
+        from pydicom.pixel_data_handlers.util import apply_voi_lut
+
+        ds = pydicom.dcmread(str(path))
+        arr = apply_voi_lut(ds.pixel_array, ds)
+        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
+            arr = arr.max() - arr
+        arr = arr.astype(np.float32)
+        lo, hi = np.percentile(arr, [1, 99])
+        if hi > lo:
+            arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+        else:
+            arr = np.zeros_like(arr)
+        return Image.fromarray((arr * 255).astype(np.uint8), mode="L")
+    return Image.open(path).convert("L")
+
+
+def rescale_box_to_original(
+    norm_box: Iterable[float], width: int, height: int
+) -> tuple[int, int, int, int]:
+    """Reverse the model's center-crop-to-square normalization."""
+    side = min(width, height)
+    x_off, y_off = (width - side) // 2, (height - side) // 2
+    nx0, ny0, nx1, ny1 = norm_box
+    return (
+        int(nx0 * side + x_off),
+        int(ny0 * side + y_off),
+        int(nx1 * side + x_off),
+        int(ny1 * side + y_off),
+    )
+
+
+def render_overlay(image: Image.Image, findings: list, out_path: Path) -> None:
+    width, height = image.size
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(image, cmap="gray")
+    for idx, (text, boxes) in enumerate(findings):
+        if not boxes:
+            continue
+        for box in boxes:
+            x0, y0, x1, y1 = rescale_box_to_original(box, width, height)
+            ax.add_patch(
+                plt.Rectangle(
+                    (x0, y0), x1 - x0, y1 - y0,
+                    fill=False, edgecolor="red", linewidth=2,
+                )
+            )
+            ax.text(x0 + 4, y0 + 4, f"#{idx + 1}",
+                    color="yellow", fontsize=11, verticalalignment="top")
+    ax.axis("off")
+    fig.tight_layout(pad=0)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.1)
+    plt.close(fig)
+
+
+def build_structured(findings: list, width: int, height: int, *,
+                     indication: str, technique: str, comparison: str,
+                     study_id: str, endpoint: str, model_version: str) -> dict:
+    return {
+        "study_id": study_id,
+        "model": {"name": "CxrReportGen", "endpoint": endpoint, "version": model_version},
+        "inputs": {"indication": indication, "technique": technique, "comparison": comparison},
+        "findings": [
+            {
+                "text": text,
+                "boxes_original": [list(rescale_box_to_original(b, width, height)) for b in (boxes or [])],
+            }
+            for text, boxes in findings
+        ],
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def build_markdown(structured: dict, overlay_filename: Optional[str]) -> str:
+    inp = structured["inputs"]
+    lines = [
+        f"# Chest X-ray report — {structured['study_id']}",
+        "",
+        "**Patient:** [redacted]   **Acquired:** " + structured["generated_at"],
+        f"**Indication:** {inp.get('indication') or '_(not provided)_'}",
+        f"**Technique:** {inp.get('technique') or '_(not provided)_'}",
+        f"**Comparison:** {inp.get('comparison') or 'None'}",
+        "",
+        "## Findings",
+        "",
+    ]
+    for idx, f in enumerate(structured["findings"], start=1):
+        loc = " *(localized — frontal)*" if f["boxes_original"] else ""
+        lines.append(f"{idx}. {f['text']}{loc}")
+    lines.append("")
+    if overlay_filename:
+        lines.append(f"![Frontal overlay]({overlay_filename})")
+        lines.append("")
+    lines.append("---")
+    lines.append(
+        f"*Generated by {structured['model']['name']} on {structured['model']['endpoint']} "
+        f"— research use only. Not for clinical diagnosis.*"
+    )
+    return "\n".join(lines)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--frontal", required=True, type=Path)
+    ap.add_argument("--lateral", type=Path, default=None)
+    ap.add_argument("--findings", required=True, type=Path,
+                    help='JSON file containing result[0]["output"] from CxrReportGenClient.submit(...)')
+    ap.add_argument("--out-dir", required=True, type=Path)
+    ap.add_argument("--study-id", default="study-001")
+    ap.add_argument("--endpoint", default="cxr-endpoint-001")
+    ap.add_argument("--model-version", default="latest")
+    ap.add_argument("--indication", default="")
+    ap.add_argument("--technique", default="")
+    ap.add_argument("--comparison", default="None")
+    args = ap.parse_args()
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    findings = json.loads(args.findings.read_text())
+    frontal = _pil_for_render(args.frontal)
+    width, height = frontal.size
+
+    structured = build_structured(
+        findings, width, height,
+        indication=args.indication, technique=args.technique, comparison=args.comparison,
+        study_id=args.study_id, endpoint=args.endpoint, model_version=args.model_version,
+    )
+
+    overlay_path = args.out_dir / "frontal_overlay.png"
+    render_overlay(frontal, findings, overlay_path)
+
+    (args.out_dir / "report.json").write_text(json.dumps(structured, indent=2))
+    (args.out_dir / "report.md").write_text(build_markdown(structured, overlay_path.name))
+
+    print(f"Wrote {args.out_dir}/report.json")
+    print(f"Wrote {args.out_dir}/report.md")
+    print(f"Wrote {overlay_path}")
+
+
+if __name__ == "__main__":
+    main()
