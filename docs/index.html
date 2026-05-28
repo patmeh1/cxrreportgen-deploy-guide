@@ -152,7 +152,7 @@ ml.online_deployments.begin_create_or_update(ManagedOnlineDeployment(
 <!-- =================== End-to-End Walkthrough =================== -->
 <section class="tab-panel" id="tab-walkthrough" role="tabpanel" aria-labelledby="tabbtn-walkthrough" tabindex="-1">
   <h1>End-to-End Walkthrough — from empty subscription to rendered report</h1>
-  <p class="lede">Seventeen sequential steps. Total active work ~1 hour, plus 20–40 min wait for the deployment to roll out. Expected one-time cost: <strong>under $10</strong> if you delete the endpoint at the end (one A100 hour ≈ $3.67 + ~$2 in Foundry hub dependencies + pennies for blob storage).</p>
+  <p class="lede">Twenty sequential steps. Total active work ~1 hour for the model itself (Steps 0&ndash;13), plus an extra ~30&ndash;45 min if you wire the production push pipeline (Steps 14&ndash;16), plus 20&ndash;40 min wait for the A100 deployment to roll out. Expected one-time cost: <strong>under $10</strong> if you delete the endpoint at the end (one A100 hour &asymp; $3.67 + ~$2 in Foundry hub dependencies + pennies for blob storage, Service Bus and Container Apps).</p>
 
   <div class="callout callout--info">
     <strong>What you'll have at the end.</strong> A live <a href="https://ai.azure.com" target="_blank" rel="noopener">Microsoft Foundry</a> project hosting the CxrReportGen model on a managed online endpoint, a locked-down Blob Storage account that ingests DICOM studies and stores generated reports, and a Python script that turns each new study into a structured radiology report (JSON + Markdown + overlay PNG) written back to blob.
@@ -168,6 +168,10 @@ ml.online_deployments.begin_create_or_update(ManagedOnlineDeployment(
   participant SA as Blob Storage (dicom-input / cxr-reports)
   participant R as Foundry model catalog (azureml registry)
   participant EP as Managed Online Endpoint (A100)
+  participant SB as Service Bus (cxr-studies queue)
+  participant L as DICOM receiver (AHDS / ACA)
+  participant W as CXR worker (ACA + KEDA)
+  participant P as PACS (Philips Vue)
   U->>CLI: az login + set subscription
   U->>ARM: az group create
   U->>ARM: check / request A100 quota
@@ -180,6 +184,16 @@ ml.online_deployments.begin_create_or_update(ManagedOnlineDeployment(
   U->>EP: invoke (toolkit passes .dcm directly)
   EP-->>U: findings + bounding boxes
   U->>SA: upload report.json + report.md + overlay PNG
+  Note over SB,W: --- Optional push pipeline (Steps 14-16) ---
+  U->>SB: create namespace + sessions-enabled queue
+  U->>L: deploy receiver (AHDS DICOM service / ACA listener)
+  U->>W: deploy worker container with KEDA on queue depth
+  P->>L: auto-route study (STOW-RS or DIMSE C-STORE)
+  L->>SA: write SOP instances to dicom-input
+  SA->>SB: BlobCreated event (via Event Grid)
+  SB->>W: deliver session (one StudyInstanceUID)
+  W->>EP: invoke for the frontal view
+  W->>SA: write report.json to cxr-reports
 </code></pre>
 
   <h2>Step 0 — Decide on names + region <span class="muted">(5 min)</span></h2>
@@ -493,26 +507,167 @@ with tempfile.TemporaryDirectory() as tmp:
 </code></pre>
   <p>The <code>boxes_original</code> coordinates are already rescaled from the model's center-cropped square back to the original DICOM pixel dimensions — see <a href="#tab=test">Test the Endpoint</a> for the rescale function. Drop the JSON into a FHIR <code>DiagnosticReport</code> resource (see the <a href="#tab=dicom">DICOM tab</a>) to write it back to your EHR.</p>
 
-  <h2>Step 14 — Sanity check the cost <span class="muted">(1 min)</span></h2>
-  <p>Open the <a href="#tab=cost-calculator">Cost Calculator</a> with your daily study volume, retention policy, and region. For a single-instance East US deployment running 24×7, expect ~$2,700–$3,200/month before storage and AHDS.</p>
+  <h2>Step 14 &mdash; Provision Service Bus for study handoff <span class="muted">(3 min)</span> <span class="muted">[optional &mdash; for production push wiring]</span></h2>
+  <p>Steps 0&ndash;13 above are the minimum to have a working endpoint you can call from Python. To turn this into a real service that picks up studies the moment the technologist finalizes them at the modality, you need a <strong>queue between the receiver and the worker</strong>. Service Bus with <strong>sessions enabled</strong> is the right primitive &mdash; a study trickles in as multiple C-STOREs over seconds, and the <code>session_id = StudyInstanceUID</code> groups them so the worker processes one whole study at a time.</p>
+<pre><code class="language-bash">export SB_NS="cxr-bus-$RANDOM"
+export SB_QUEUE="cxr-studies"
 
-  <h2>Step 15 — Production hardening <span class="muted">(separate workstreams)</span></h2>
+az servicebus namespace create -g "$RG" -n "$SB_NS" -l "$LOC" --sku Standard
+az servicebus queue create -g "$RG" --namespace-name "$SB_NS" -n "$SB_QUEUE" \
+  --enable-session true --max-delivery-count 10 \
+  --lock-duration PT2M --default-message-time-to-live P1D
+
+export SB_RID=$(az servicebus queue show -g "$RG" --namespace-name "$SB_NS" -n "$SB_QUEUE" --query id -o tsv)
+export SB_FQDN="$SB_NS.servicebus.windows.net"
+</code></pre>
+  <p>Standard SKU is required &mdash; Basic doesn't support sessions, and Premium is overkill until you're past ~1M messages/day or need VNet integration. See the <a href="#tab=listener">DICOM Listener tab</a> for the why on lock duration, TTL, max delivery count, and KEDA scaling.</p>
+
+  <h2>Step 15 &mdash; Stand up the DICOM receiver <span class="muted">(10&ndash;30 min)</span></h2>
+  <p>The receiver lands inbound DICOM bytes in <code>dicom-input</code> and posts a Service Bus message keyed by <code>StudyInstanceUID</code>. Three options &mdash; same downstream, different protocol on the PACS side. Full comparison + the reference Python samples live in the <a href="#tab=listener">DICOM Listener tab</a>; the AHDS path below is the recommended default.</p>
+
+  <h3>Option A &mdash; Azure Health Data Services DICOM service (recommended)</h3>
+  <p>Fully managed STOW-RS / WADO-RS / QIDO-RS endpoint with a built-in change feed that emits <code>DicomImageCreated</code> events to Event Grid. You don't operate any container.</p>
+<pre><code class="language-bash">export WS="cxr-ahds"
+export DCM="cxr-dicom"
+
+az extension add -n healthcareapis --upgrade --only-show-errors
+az healthcareapis workspace create        -g "$RG" -n "$WS" -l "$LOC"
+az healthcareapis workspace dicomservice create        -g "$RG" --workspace-name "$WS" -n "$DCM"
+
+export DCM_RID=$(az healthcareapis workspace dicomservice show -g "$RG" --workspace-name "$WS" -n "$DCM" --query id -o tsv)
+export DCM_URI=$(az healthcareapis workspace dicomservice show -g "$RG" --workspace-name "$WS" -n "$DCM" --query serviceUrl -o tsv)
+
+# Forward AHDS DicomImageCreated events to the Service Bus queue
+az eventgrid system-topic create -g "$RG" -n cxr-dicom-topic \
+  --topic-type Microsoft.HealthcareApis.DicomServices --source "$DCM_RID" -l "$LOC"
+az eventgrid system-topic event-subscription create \
+  -g "$RG" --system-topic-name cxr-dicom-topic -n cxr-imagestored-sub \
+  --endpoint-type servicebusqueue --endpoint "$SB_RID" \
+  --included-event-types "Microsoft.HealthcareApis.DicomImageCreated"
+
+echo "Configure Philips Vue PACS to STOW-RS push to: $DCM_URI/v2/studies"
+</code></pre>
+  <p>On the Vue PACS side, register an Entra app, grant it the <strong>DICOM Data Owner</strong> role on <code>$DCM</code>, hand the PACS the client_id / client_secret, and add a routing rule that auto-routes finalized CR / DX studies to the DICOMweb base URL above.</p>
+
+  <h3>Option B &mdash; pynetdicom C-STORE SCP on Container Apps (for DIMSE-only PACS)</h3>
+  <p>Use this when the PACS speaks classic DIMSE (TCP/11112) and can't be configured for DICOMweb. The reference listener is <a href="assets/samples/dimse_listener.py" target="_blank" rel="noopener"><code>dimse_listener.py</code></a> + <a href="assets/samples/listener.Dockerfile" target="_blank" rel="noopener"><code>listener.Dockerfile</code></a>. Container Apps supports raw TCP ingress on an internal-only environment, so the listener stays on your VNet (reach it from on-prem via S2S VPN or ExpressRoute).</p>
+<pre><code class="language-bash">export ACR="cxracr$RANDOM"
+export ACA_ENV="cxr-listener-env"
+export SUBNET_ID="/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Network/virtualNetworks/cxr-vnet/subnets/listeners"
+
+az acr create -g "$RG" -n "$ACR" --sku Basic
+az acr build --registry "$ACR" --image cxr-dimse-listener:1.0 \
+  --file docs/assets/samples/listener.Dockerfile docs/assets/samples
+
+# User-assigned managed identity used by the listener and the worker
+az identity create -g "$RG" -n cxr-uami
+export ID_RID=$(az identity show -g "$RG" -n cxr-uami --query id -o tsv)
+export ID_CID=$(az identity show -g "$RG" -n cxr-uami --query clientId -o tsv)
+export SA_RID=$(az storage account show -g "$RG" -n "$SA" --query id -o tsv)
+
+az role assignment create --assignee "$ID_CID" --role "Storage Blob Data Contributor" --scope "$SA_RID"
+az role assignment create --assignee "$ID_CID" --role "Azure Service Bus Data Sender"   --scope "$SB_RID"
+az role assignment create --assignee "$ID_CID" --role "AcrPull" --scope "$(az acr show -n "$ACR" --query id -o tsv)"
+
+az containerapp env create -g "$RG" -n "$ACA_ENV" -l "$LOC" \
+  --internal-only true --infrastructure-subnet-resource-id "$SUBNET_ID"
+
+az containerapp create -g "$RG" -n cxr-dimse-listener --environment "$ACA_ENV" \
+  --image "$ACR.azurecr.io/cxr-dimse-listener:1.0" \
+  --user-assigned "$ID_RID" --registry-server "$ACR.azurecr.io" --registry-identity "$ID_RID" \
+  --ingress internal --transport tcp --target-port 11112 --exposed-port 11112 \
+  --min-replicas 1 --max-replicas 3 \
+  --env-vars STORAGE_ACCOUNT="$SA" SB_FQDN="$SB_FQDN" SB_QUEUE="$SB_QUEUE" \
+             AE_TITLE=CXR-INTAKE \
+             ALLOWED_CALLING_AES=VUEPACS_PROD,VUEPACS_DR \
+             INPUT_CONTAINER="$IN_CONTAINER" \
+             AZURE_CLIENT_ID="$ID_CID"
+</code></pre>
+
+  <h3>Option C &mdash; Custom STOW-RS on Container Apps</h3>
+  <p>Use this only when you need STOW-RS plus custom auth (bearer token, mTLS) or routing rules AHDS doesn't expose. The reference app is <a href="assets/samples/stow_listener.py" target="_blank" rel="noopener"><code>stow_listener.py</code></a>. Same Container Apps deployment pattern as Option B but with <code>--transport auto --target-port 8080</code> (HTTPS) instead of TCP ingress.</p>
+
+  <h2>Step 16 &mdash; Deploy the worker and verify end-to-end push <span class="muted">(10 min)</span></h2>
+  <p>The worker is a Container App that pulls one session (one study) at a time off Service Bus, gathers SOP instances for ~30s, picks the PA/AP frontal view, base64-encodes the PNG, invokes the endpoint, and writes <code>report.json</code> to <code>cxr-reports</code>. The reference implementation is <a href="assets/samples/sb_worker.py" target="_blank" rel="noopener"><code>sb_worker.py</code></a>; the KEDA <code>azure-servicebus</code> scaler scales it from zero to your AML concurrency cap on queue depth.</p>
+<pre><code class="language-bash"># Build the worker image (reuses the UAMI and ACR from Step 15)
+az acr build --registry "$ACR" --image cxr-worker:1.0 \
+  --file docs/assets/samples/worker.Dockerfile docs/assets/samples
+
+# Worker needs to receive from Service Bus and invoke the AML endpoint
+az role assignment create --assignee "$ID_CID" \
+  --role "Azure Service Bus Data Receiver" --scope "$SB_RID"
+export EP_RID=$(az ml online-endpoint show -n "$EP" -g "$RG" --workspace-name "$PROJ" --query id -o tsv)
+az role assignment create --assignee "$ID_CID" --role "AzureML Data Scientist" --scope "$EP_RID"
+
+az containerapp create -g "$RG" -n cxr-worker --environment "$ACA_ENV" \
+  --image "$ACR.azurecr.io/cxr-worker:1.0" \
+  --user-assigned "$ID_RID" --registry-server "$ACR.azurecr.io" --registry-identity "$ID_RID" \
+  --min-replicas 0 --max-replicas 10 \
+  --scale-rule-name sb-depth --scale-rule-type azure-servicebus \
+  --scale-rule-metadata "queueName=$SB_QUEUE" "namespace=$SB_NS" "messageCount=5" \
+  --scale-rule-identity "$ID_RID" \
+  --env-vars STORAGE_ACCOUNT="$SA" SB_FQDN="$SB_FQDN" SB_QUEUE="$SB_QUEUE" \
+             INPUT_CONTAINER="$IN_CONTAINER" OUTPUT_CONTAINER="$OUT_CONTAINER" \
+             CXR_ENDPOINT_URI="$SCORING_URI" CXR_DEPLOYMENT_NAME="$DEP" \
+             AZURE_CLIENT_ID="$ID_CID"
+</code></pre>
+
+  <h3>Smoke-test the push pipeline</h3>
+  <p>Pick the transport that matches your receiver and shove one study through to confirm everything between the PACS and the report blob is wired correctly:</p>
+<pre><code class="language-bash"># --- For DIMSE receivers (Option B) ---
+# 1) C-ECHO to confirm AE Title + association
+echoscu -aet VUEPACS_PROD -aec CXR-INTAKE \
+  cxr-dimse-listener.internal.&lt;envid&gt;.eastus.azurecontainerapps.io 11112
+
+# 2) C-STORE the sample study (requires DCMTK installed on the test box)
+storescu -aet VUEPACS_PROD -aec CXR-INTAKE \
+  cxr-dimse-listener.internal.&lt;envid&gt;.eastus.azurecontainerapps.io 11112 \
+  my_study/*.dcm
+
+# --- For STOW-RS receivers (Options A and C) ---
+TOKEN=$(az account get-access-token --resource "$DCM_URI" --query accessToken -o tsv)
+curl -X POST "$DCM_URI/v2/studies" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/dicom" \
+  --data-binary "@my_study/frontal.dcm"
+
+# --- Watch the report land in cxr-reports ---
+STUDY_UID=$(python -c "import pydicom; print(pydicom.dcmread('my_study/frontal.dcm').StudyInstanceUID)")
+az storage blob list --account-name "$SA" --container-name "$OUT_CONTAINER" \
+  --auth-mode login --prefix "$STUDY_UID" -o table
+
+# Tail the worker logs while you wait
+az containerapp logs show -g "$RG" -n cxr-worker --follow
+</code></pre>
+  <p>When a <code>&lt;StudyInstanceUID&gt;/report.json</code> blob appears in <code>$OUT_CONTAINER</code>, the full pipeline &mdash; modality &rarr; PACS &rarr; receiver &rarr; blob &rarr; Event Grid &rarr; Service Bus &rarr; worker &rarr; endpoint &rarr; blob &mdash; is live and you can hand the PACS team your destination AE / STOW-RS URL for production routing rules.</p>
+
+  <h2>Step 17 &mdash; Sanity check the cost <span class="muted">(1 min)</span></h2>
+  <p>Open the <a href="#tab=cost-calculator">Cost Calculator</a> with your daily study volume, retention policy, and region. For a single-instance East US deployment running 24&times;7, expect ~$2,700&ndash;$3,200/month before storage and AHDS. The push pipeline (Steps 14&ndash;16) adds ~$10/month for Service Bus Standard + ~$15/month for two always-on small Container Apps + ~$1/month per 1M DICOM instances stored at AHDS.</p>
+
+  <h2>Step 18 &mdash; Production hardening <span class="muted">(separate workstreams)</span></h2>
   <p>Before this serves real workloads, walk these tabs:</p>
   <ul>
-    <li><a href="#tab=networking">Networking &amp; Security</a> — managed VNet, private endpoint, NSG, ExpressRoute.</li>
-    <li><a href="#tab=compliance">Compliance &amp; RAI</a> — PHI scrub, HIPAA BAA, data residency, model-card disclosure.</li>
-    <li><a href="#tab=ops">Monitoring &amp; Ops</a> — App Insights dashboards, autoscale rules, blue/green rollouts.</li>
-    <li><a href="#tab=dicom">DICOM Ingestion</a> — PACS / DICOMweb / FHIR write-back wiring.</li>
+    <li><a href="#tab=networking">Networking &amp; Security</a> &mdash; managed VNet, private endpoint, NSG, ExpressRoute, AE Title whitelisting on the receiver.</li>
+    <li><a href="#tab=compliance">Compliance &amp; RAI</a> &mdash; PHI scrub, HIPAA BAA, data residency, model-card disclosure.</li>
+    <li><a href="#tab=ops">Monitoring &amp; Ops</a> &mdash; App Insights dashboards, autoscale rules, blue/green rollouts, Service Bus queue-depth / DLQ alerts.</li>
+    <li><a href="#tab=listener">DICOM Listener</a> &mdash; TLS for DIMSE, customer-managed keys on Service Bus, full networking checklist.</li>
+    <li><a href="#tab=dicom">DICOM Ingestion</a> &mdash; per-instance preprocessing, FHIR <code>DiagnosticReport</code> write-back to the EHR.</li>
   </ul>
 
-  <h2>Step 16 — Clean up <span class="muted">(30 s — do this when you're done experimenting!)</span></h2>
+  <h2>Step 19 &mdash; Clean up <span class="muted">(30 s &mdash; do this when you're done experimenting!)</span></h2>
 <pre><code class="language-bash"># Stop the A100 meter (project + storage stay)
 az ml online-endpoint delete -n "$EP" -y
+
+# Pause the push pipeline (cheap but not free if left running)
+az containerapp delete -g "$RG" -n cxr-worker -y
+az containerapp delete -g "$RG" -n cxr-dimse-listener -y   # if Option B was used
+az servicebus namespace delete -g "$RG" -n "$SB_NS"
 
 # Or nuke the project but keep the hub (faster re-deploy later)
 az ml workspace delete -g "$RG" -n "$PROJ" -y --permanently-delete
 
-# Or burn everything to the ground — hub, project, storage, App Insights, KV, ACR
+# Or burn everything to the ground &mdash; hub, project, storage, App Insights, KV, ACR,
+# Service Bus, Container Apps env, AHDS DICOM service
 az group delete -n "$RG" -y --no-wait
 </code></pre>
 
@@ -601,7 +756,7 @@ bash deploy_cxrreportgen_end_to_end.sh
       <tr><td>19</td><td>Upload to blob</td><td><code>az storage blob upload-batch --auth-mode login</code> (no keys on wire).</td><td><a href="#tab=walkthrough">Step 12b</a></td></tr>
       <tr><td>20</td><td>Inference</td><td>Single Python block: download &rarr; invoke &rarr; render JSON/MD/overlay &rarr; upload.</td><td><a href="#tab=walkthrough">Step 12b</a></td></tr>
       <tr><td>21</td><td>Verify</td><td><code>az storage blob list</code> on the output container.</td><td>&mdash;</td></tr>
-      <tr><td>22</td><td>Summary + cleanup</td><td>Print Foundry portal link, endpoint URL, blob URL, and the cleanup command.</td><td><a href="#tab=walkthrough">Step 16</a></td></tr>
+      <tr><td>22</td><td>Summary + cleanup</td><td>Print Foundry portal link, endpoint URL, blob URL, and the cleanup command.</td><td><a href="#tab=walkthrough">Step 19</a></td></tr>
     </tbody>
   </table>
 
