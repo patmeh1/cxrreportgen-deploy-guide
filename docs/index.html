@@ -1424,7 +1424,7 @@ curl -fsSL https://aka.ms/install-azd.sh | bash
 <!-- =================== Vue PACS + Epic =================== -->
 <section class="tab-panel" id="tab-pacs" role="tabpanel" aria-labelledby="tabbtn-pacs" tabindex="-1">
   <h1>Vue PACS &amp; Epic &mdash; Pulling clinical DICOM into the pipeline</h1>
-  <p class="lede">Wire your hospital PACS (Hyland <strong>Vue PACS</strong>) and EHR (<strong>Epic</strong>) into the CXRReportGen pipeline so chest X-ray studies acquired in the clinic flow automatically into the <code>dicom-input</code> blob container and out as structured radiology reports.</p>
+  <p class="lede">Wire your hospital PACS (Philips <strong>Vue PACS</strong>) and EHR (<strong>Epic</strong>) into the CXRReportGen pipeline so chest X-ray studies acquired in the clinic flow automatically into the <code>dicom-input</code> blob container and out as structured radiology reports.</p>
 
   <div class="callout">
     <strong>The integration in one sentence.</strong> Vue PACS holds the pixel data and speaks DICOMweb (QIDO-RS query / WADO-RS retrieve / STOW-RS store) plus classic DIMSE. Epic does not store DICOM &mdash; it exposes imaging metadata via the FHIR R4 <code>ImagingStudy</code> resource, whose <code>.endpoint</code> resolves back to the Vue PACS WADO-RS URL. You either watch Vue directly (Pattern A), or watch Epic and follow the link back to Vue (Pattern B). Either way, DICOMs land in the same <code>dicom-input</code> container and the existing CXRReportGen flow takes over.
@@ -1485,7 +1485,7 @@ curl -fsSL https://aka.ms/install-azd.sh | bash
 
   <div class="inner-tab-panel active" data-inner="patternA">
     <h3>Pattern A &mdash; pull straight from Vue PACS via DICOMweb</h3>
-    <p>Hyland Vue PACS exposes the standard DICOMweb services: <code>QIDO-RS</code> for query, <code>WADO-RS</code> for retrieve, and (optionally) <code>STOW-RS</code> for store. We will use the open-source <a href="https://github.com/ImagingDataCommons/dicomweb-client" target="_blank" rel="noopener">dicomweb-client</a> Python library to talk to it.</p>
+    <p>Philips Vue PACS exposes the standard DICOMweb services: <code>QIDO-RS</code> for query, <code>WADO-RS</code> for retrieve, and (optionally) <code>STOW-RS</code> for store. We will use the open-source <a href="https://github.com/ImagingDataCommons/dicomweb-client" target="_blank" rel="noopener">dicomweb-client</a> Python library to talk to it.</p>
 
     <h4>Step A1 &mdash; Network connectivity</h4>
     <p>The Vue PACS DICOMweb endpoint is almost never on the public internet. You need one of:</p>
@@ -1698,7 +1698,7 @@ python epic_imagingstudy_pull.py --modality CR,DX --interval 60</code></pre>
     <li><a href="assets/samples/epic_imagingstudy_pull.py"><code>assets/samples/epic_imagingstudy_pull.py</code></a> &mdash; Pattern B Epic-driven worker.</li>
     <li><a href="https://github.com/ImagingDataCommons/dicomweb-client" target="_blank" rel="noopener">dicomweb-client (Python)</a> &mdash; the DICOMweb SDK used in both samples.</li>
     <li><a href="https://fhir.epic.com/Specifications?api=10005" target="_blank" rel="noopener">Epic FHIR R4 ImagingStudy spec</a> and <a href="https://fhir.epic.com/Documentation?docId=oauth2&amp;section=BackendOAuth2Guide" target="_blank" rel="noopener">Backend Services OAuth2 guide</a>.</li>
-    <li><a href="https://www.hyland.com/en/solutions/products/vue-pacs" target="_blank" rel="noopener">Hyland Vue PACS</a> &mdash; vendor product page (DICOMweb support details require Hyland community access).</li>
+    <li><a href="https://www.philips.com/healthcare/product/HCNOCTN330/vue-pacs-enterprise-imaging" target="_blank" rel="noopener">Philips Vue PACS (Enterprise Imaging)</a> &mdash; vendor product page. Detailed DICOMweb conformance is in the Philips Vue PACS DICOM Conformance Statement (request through your Philips account team).</li>
     <li><a href="https://learn.microsoft.com/en-us/azure/healthcare-apis/dicom/overview" target="_blank" rel="noopener">Azure Health Data Services DICOM service</a> &mdash; if you want a managed DICOMweb relay.</li>
   </ul>
 </section>

@@ -1,7 +1,7 @@
 """
 pacs_pull.py — Pattern A: Vue PACS direct (DICOMweb)
 ====================================================
-Polls a Hyland Vue PACS DICOMweb endpoint (QIDO-RS) for new chest X-ray
+Polls a Philips Vue PACS DICOMweb endpoint (QIDO-RS) for new chest X-ray
 studies, retrieves every instance via WADO-RS, and uploads each .dcm to
 the dicom-input Azure Blob container that the CXRReportGen pipeline
 already watches.
