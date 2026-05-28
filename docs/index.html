@@ -47,6 +47,7 @@
     <div class="nav-group" data-group="use">
       <button class="nav-group-toggle" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false" aria-controls="menu-use">Use</button>
       <div class="nav-group-menu" id="menu-use" role="menu" aria-label="Use">
+        <button class="tab-button" role="tab" data-tab="pacs"  aria-controls="tab-pacs"  id="tabbtn-pacs">Vue PACS &amp; Epic</button>
         <button class="tab-button" role="tab" data-tab="dicom" aria-controls="tab-dicom" id="tabbtn-dicom">DICOM Ingestion</button>
         <button class="tab-button" role="tab" data-tab="test"  aria-controls="tab-test"  id="tabbtn-test">Test the Endpoint</button>
       </div>
@@ -78,6 +79,7 @@
     <option value="script">All-in-one Script</option>
     <option value="prereqs">Prerequisites</option>
     <option value="architecture">Architecture</option>
+    <option value="pacs">Vue PACS &amp; Epic</option>
     <option value="dicom">DICOM Ingestion</option>
     <option value="deploy">Deploy</option>
     <option value="test">Test the Endpoint</option>
@@ -1419,7 +1421,290 @@ curl -fsSL https://aka.ms/install-azd.sh | bash
 </code></pre>
 </section>
 
-<!-- =================== DICOM =================== -->
+<!-- =================== Vue PACS + Epic =================== -->
+<section class="tab-panel" id="tab-pacs" role="tabpanel" aria-labelledby="tabbtn-pacs" tabindex="-1">
+  <h1>Vue PACS &amp; Epic &mdash; Pulling clinical DICOM into the pipeline</h1>
+  <p class="lede">Wire your hospital PACS (Hyland <strong>Vue PACS</strong>) and EHR (<strong>Epic</strong>) into the CXRReportGen pipeline so chest X-ray studies acquired in the clinic flow automatically into the <code>dicom-input</code> blob container and out as structured radiology reports.</p>
+
+  <div class="callout">
+    <strong>The integration in one sentence.</strong> Vue PACS holds the pixel data and speaks DICOMweb (QIDO-RS query / WADO-RS retrieve / STOW-RS store) plus classic DIMSE. Epic does not store DICOM &mdash; it exposes imaging metadata via the FHIR R4 <code>ImagingStudy</code> resource, whose <code>.endpoint</code> resolves back to the Vue PACS WADO-RS URL. You either watch Vue directly (Pattern A), or watch Epic and follow the link back to Vue (Pattern B). Either way, DICOMs land in the same <code>dicom-input</code> container and the existing CXRReportGen flow takes over.
+  </div>
+
+  <h2>Topology</h2>
+<pre><code class="language-mermaid">flowchart LR
+  subgraph HOSP ["Hospital network"]
+    MOD["CR / DX modalities"]
+    VUE[("Vue PACS - DICOMweb + DIMSE")]
+    EPIC[("Epic FHIR - ImagingStudy / Endpoint")]
+    MOD -->|DIMSE C-STORE| VUE
+    EPIC -. ImagingStudy endpoint .-> VUE
+  end
+
+  subgraph AZ ["Azure subscription - Foundry project RG"]
+    direction LR
+    CONN["Connector - Container App or Function"]
+    BLOB[("dicom-input blob container")]
+    AHDS[("AHDS DICOM service - optional")]
+    EP[["CxrReportGen online endpoint"]]
+    OUT[("cxr-reports blob container")]
+    CONN -->|WADO-RS pull| BLOB
+    CONN -.->|STOW-RS optional| AHDS
+    AHDS -.->|change feed| BLOB
+    BLOB -->|Event Grid| EP
+    EP --> OUT
+  end
+
+  VUE -. via VPN or ExpressRoute .-> CONN
+  EPIC -. FHIR API .-> CONN
+
+  classDef ext fill:#fff3cd,stroke:#b08800
+  class HOSP ext
+</code></pre>
+
+  <h2>Two integration patterns</h2>
+  <table>
+    <thead>
+      <tr><th>Aspect</th><th>Pattern A &mdash; Vue PACS direct</th><th>Pattern B &mdash; Epic-driven</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Trigger</td><td>Poll QIDO-RS for new studies, or DIMSE C-FIND scheduled query</td><td>FHIR <code>ImagingStudy</code> subscription, polling, or HL7 v2 ORU bus</td></tr>
+      <tr><td>Auth</td><td>OAuth2 client_credentials against Vue, or HTTP basic, or DIMSE AE-title peering</td><td>SMART on FHIR Backend Services (JWT signed with a key registered in Epic App Orchard)</td></tr>
+      <tr><td>Order context</td><td>None &mdash; just the StudyInstanceUID, AccessionNumber, and DICOM tags</td><td>Full EHR context: ServiceRequest, Encounter, Patient, indication text</td></tr>
+      <tr><td>Best when</td><td>Pure radiology pipeline; you control the PACS; latency &lt; 60s matters</td><td>You need order/exam metadata; reports get FHIR DiagnosticReport write-back; multi-tenant clinical app</td></tr>
+      <tr><td>Network path</td><td>Connector &rarr; Vue DICOMweb (via VPN/ExpressRoute or Private Link)</td><td>Connector &rarr; Epic FHIR (Internet/PE) &rarr; Vue DICOMweb (VPN/ER)</td></tr>
+      <tr><td>Latency target</td><td>Sub-minute (study completion to report)</td><td>1-5 min (FHIR subscription / poll cadence)</td></tr>
+    </tbody>
+  </table>
+
+  <p>Both patterns terminate in the same place &mdash; an upload to <code>dicom-input/&lt;StudyInstanceUID&gt;/&lt;SOPInstanceUID&gt;.dcm</code>. The CXRReportGen pipeline picks it up from there (see <a href="#tab=walkthrough">End-to-End Walkthrough Step 12b</a> or wire an Event Grid blob-created subscription for hands-off processing).</p>
+
+  <div class="inner-tabs" role="tablist" aria-label="Integration pattern">
+    <button class="inner-tab-btn" role="tab" data-inner="patternA" aria-selected="true">Pattern A &mdash; Vue PACS direct</button>
+    <button class="inner-tab-btn" role="tab" data-inner="patternB" aria-selected="false">Pattern B &mdash; Epic-driven</button>
+  </div>
+
+  <div class="inner-tab-panel active" data-inner="patternA">
+    <h3>Pattern A &mdash; pull straight from Vue PACS via DICOMweb</h3>
+    <p>Hyland Vue PACS exposes the standard DICOMweb services: <code>QIDO-RS</code> for query, <code>WADO-RS</code> for retrieve, and (optionally) <code>STOW-RS</code> for store. We will use the open-source <a href="https://github.com/ImagingDataCommons/dicomweb-client" target="_blank" rel="noopener">dicomweb-client</a> Python library to talk to it.</p>
+
+    <h4>Step A1 &mdash; Network connectivity</h4>
+    <p>The Vue PACS DICOMweb endpoint is almost never on the public internet. You need one of:</p>
+    <ul>
+      <li><strong>Site-to-site VPN</strong> from your Azure VNet to the hospital network (smallest blast radius for a pilot).</li>
+      <li><strong>ExpressRoute</strong> for production volume (predictable latency, dedicated bandwidth).</li>
+      <li><strong>Azure Private Link Service</strong> exposed by the hospital if they have it.</li>
+      <li><strong>Reverse-tunnel agent</strong> (e.g. Azure Arc-enabled connector running inside the hospital DMZ that pushes outward to the Azure connector over HTTPS).</li>
+    </ul>
+    <p>Whatever the path, the connector Container App or Function App lives in a subnet on the Azure side that can resolve <code>https://vue.example.org/dicomweb</code> and present a client cert if required. See the <a href="#tab=networking">Networking &amp; Security</a> tab for VNet topology details.</p>
+
+    <h4>Step A2 &mdash; Register a service account in Vue</h4>
+    <p>Have the PACS admin create an OAuth2 client (preferred) or service-account credentials with the minimum role for DICOMweb read. The credentials land in Key Vault (auto-provisioned with the Foundry hub in Step 7 of the script):</p>
+<pre><code class="language-bash">az keyvault secret set --vault-name "$KV"  -n pacs-client-id     --value "$PACS_CLIENT_ID"
+az keyvault secret set --vault-name "$KV"  -n pacs-client-secret --value "$PACS_CLIENT_SECRET"
+az keyvault secret set --vault-name "$KV"  -n pacs-token-url     --value "https://vue.example.org/oauth/token"
+az keyvault secret set --vault-name "$KV"  -n pacs-base          --value "https://vue.example.org/dicomweb"</code></pre>
+    <p>The connector reads these at runtime via <code>DefaultAzureCredential</code> &mdash; no plaintext secrets in code or env files.</p>
+
+    <h4>Step A3 &mdash; Query (QIDO-RS): find recent CR/DX studies</h4>
+<pre><code class="language-python">from dicomweb_client.api import DICOMwebClient
+import requests, datetime
+
+session = requests.Session()
+session.headers["Authorization"] = f"Bearer {bearer_token}"   # from OAuth2 client_credentials
+
+client = DICOMwebClient(url="https://vue.example.org/dicomweb", session=session)
+
+studies = client.search_for_studies(search_filters={
+    "ModalitiesInStudy": "CR\\DX",          # backslash = DICOM multi-value separator
+    "StudyDate": f"{datetime.date.today():%Y%m%d}-",  # today onward
+    "limit": 100,
+})
+for s in studies:
+    print(s.StudyInstanceUID, s.PatientID, s.AccessionNumber)</code></pre>
+
+    <h4>Step A4 &mdash; Retrieve (WADO-RS) and upload to blob</h4>
+<pre><code class="language-python">from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient
+
+svc = BlobServiceClient(
+    account_url=f"https://{STORAGE_ACCOUNT}.blob.core.windows.net",
+    credential=DefaultAzureCredential(),
+)
+container = svc.get_container_client("dicom-input")
+
+for study in studies:
+    uid = study.StudyInstanceUID
+    for ds in client.retrieve_study(uid):           # one Dataset per SOP instance
+        from io import BytesIO
+        buf = BytesIO(); ds.save_as(buf, write_like_original=False); buf.seek(0)
+        container.upload_blob(name=f"{uid}/{ds.SOPInstanceUID}.dcm",
+                              data=buf, overwrite=True)</code></pre>
+
+    <h4>Step A5 &mdash; Full reference implementation</h4>
+    <p>The full polling worker (auth, dedup, retry, structured logging) is at <a href="assets/samples/pacs_pull.py"><code>assets/samples/pacs_pull.py</code></a>. Run it locally or package as a Container App job:</p>
+<pre><code class="language-bash">pip install dicomweb-client pydicom pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg \
+            azure-storage-blob azure-identity requests
+
+PACS_BASE=https://vue.example.org/dicomweb \
+PACS_TOKEN_URL=https://vue.example.org/oauth/token \
+PACS_CLIENT_ID=cxr-connector  PACS_CLIENT_SECRET=$(az keyvault secret show --vault-name "$KV" -n pacs-client-secret --query value -o tsv) \
+STORAGE_ACCOUNT=cxrdicom1234 \
+python pacs_pull.py --modality CR,DX --interval 30</code></pre>
+
+    <h4>Step A6 &mdash; Trigger CXRReportGen</h4>
+    <p>Once the <code>.dcm</code> lands in the blob container, you have two options:</p>
+    <ul>
+      <li><strong>Push:</strong> the worker calls the endpoint directly after upload (synchronous, lowest latency).</li>
+      <li><strong>Event-driven:</strong> subscribe an Azure Function to <code>Microsoft.Storage.BlobCreated</code> events on <code>dicom-input</code>; the function pairs the frontal+lateral instances of a study and invokes the endpoint. See <a href="#tab=walkthrough">Walkthrough Step 12b</a> for the inference snippet, and <a href="#tab=ops">Monitoring &amp; Ops</a> for the Event Grid wiring.</li>
+    </ul>
+  </div>
+
+  <div class="inner-tab-panel" data-inner="patternB">
+    <h3>Pattern B &mdash; pull from Vue via Epic FHIR <code>ImagingStudy</code></h3>
+    <p>Epic does not store DICOM pixels &mdash; it stores <em>references</em> to studies that live in Vue PACS. The reference is a FHIR R4 <code>ImagingStudy</code> resource whose <code>endpoint</code> attribute points at a FHIR <code>Endpoint</code> resource, whose <code>address</code> is the WADO-RS base URL back at Vue. Following that chain lets you write an order-aware pipeline that fires the moment Epic marks a study <code>status=available</code>.</p>
+
+    <h4>Step B1 &mdash; Register a Backend Services client in Epic</h4>
+    <p>Via <a href="https://fhir.epic.com/Developer" target="_blank" rel="noopener">fhir.epic.com</a> (Developer Portal) or your customer's App Orchard / Vendor Services tenant:</p>
+    <ol>
+      <li>Create a new app with <strong>Backend Services</strong> auth type (no user context).</li>
+      <li>Upload your public JWKS (RS384 key pair generated with <code>openssl genrsa</code> + <code>openssl rsa -pubout</code>).</li>
+      <li>Request the FHIR scopes <code>system/ImagingStudy.read</code> and <code>system/Endpoint.read</code>.</li>
+      <li>Have the Epic customer approve the install on their tenant.</li>
+    </ol>
+    <p>Stash the private key, kid, and client_id in Key Vault:</p>
+<pre><code class="language-bash">az keyvault secret set --vault-name "$KV" -n epic-client-id  --value "$EPIC_CLIENT_ID"
+az keyvault secret set --vault-name "$KV" -n epic-kid        --value "$EPIC_KID"
+az keyvault secret set --vault-name "$KV" -n epic-token-url  --value "$EPIC_TOKEN_URL"
+az keyvault secret set --vault-name "$KV" -n epic-base       --value "$EPIC_FHIR_BASE"
+az keyvault secret set --vault-name "$KV" -n epic-priv-key   --file ./epic-private.pem</code></pre>
+
+    <h4>Step B2 &mdash; Acquire a SMART Backend Services access token</h4>
+<pre><code class="language-python">import jwt, uuid, time, requests
+
+now = int(time.time())
+assertion = jwt.encode({
+    "iss": EPIC_CLIENT_ID, "sub": EPIC_CLIENT_ID,
+    "aud": EPIC_TOKEN_URL,
+    "jti": str(uuid.uuid4()),
+    "iat": now, "exp": now + 270,                # max 5 min per SMART
+}, EPIC_PRIVATE_KEY, algorithm="RS384", headers={"kid": EPIC_KID})
+
+token = requests.post(EPIC_TOKEN_URL, data={
+    "grant_type": "client_credentials",
+    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    "client_assertion": assertion,
+    "scope": "system/ImagingStudy.read system/Endpoint.read",
+}, timeout=10).json()["access_token"]</code></pre>
+
+    <h4>Step B3 &mdash; List new ImagingStudy resources</h4>
+<pre><code class="language-python">headers = {"Authorization": f"Bearer {token}",
+           "Accept": "application/fhir+json"}
+
+q = ("ImagingStudy?status=available"
+     "&amp;_lastUpdated=ge2026-05-28T00:00:00Z"
+     "&amp;modality=CR,DX&amp;_count=50")
+bundle = requests.get(f"{EPIC_FHIR_BASE}/{q}", headers=headers, timeout=20).json()
+
+for entry in bundle.get("entry", []):
+    study = entry["resource"]
+    print(study["id"], study["identifier"][0]["value"], len(study.get("endpoint", [])))</code></pre>
+
+    <h4>Step B4 &mdash; Follow <code>ImagingStudy.endpoint</code> to Vue PACS</h4>
+<pre><code class="language-python">ep_ref = study["endpoint"][0]["reference"]                   # e.g. "Endpoint/12345"
+ep = requests.get(f"{EPIC_FHIR_BASE}/{ep_ref}", headers=headers).json()
+wado_base = ep["address"].rstrip("/")                        # e.g. https://vue.example.org/dicomweb
+
+# The same Backend Services token usually works against Vue if your Epic
+# tenant has federated identity to PACS; if not, swap to a Vue OAuth client
+# from Pattern A here.</code></pre>
+
+    <h4>Step B5 &mdash; Retrieve from Vue and land in blob</h4>
+<pre><code class="language-python">from dicomweb_client.api import DICOMwebClient
+
+session = requests.Session()
+session.headers["Authorization"] = f"Bearer {token}"
+
+client = DICOMwebClient(url=wado_base, session=session)
+study_uid = study["identifier"][0]["value"].replace("urn:oid:", "")
+
+for ds in client.retrieve_study(study_uid):
+    container.upload_blob(name=f"{study_uid}/{ds.SOPInstanceUID}.dcm",
+                          data=_dataset_bytes(ds), overwrite=True)</code></pre>
+
+    <h4>Step B6 &mdash; Full reference implementation</h4>
+    <p>The full poller (token caching, paging, dedup, study-completion gating) is at <a href="assets/samples/epic_imagingstudy_pull.py"><code>assets/samples/epic_imagingstudy_pull.py</code></a>:</p>
+<pre><code class="language-bash">pip install dicomweb-client pydicom pyjwt cryptography requests \
+            azure-storage-blob azure-identity
+
+EPIC_BASE=https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4 \
+EPIC_TOKEN_URL=https://fhir.epic.com/interconnect-fhir-oauth/oauth2/token \
+EPIC_CLIENT_ID=...  EPIC_KID=...  EPIC_PRIVATE_KEY=./epic-private.pem \
+PACS_BASE=https://vue.example.org/dicomweb \
+STORAGE_ACCOUNT=cxrdicom1234 \
+python epic_imagingstudy_pull.py --modality CR,DX --interval 60</code></pre>
+
+    <h4>Step B7 &mdash; Write the report back to Epic</h4>
+    <p>Once CXRReportGen returns the structured findings, post a FHIR <code>DiagnosticReport</code> back to Epic referencing the original <code>ServiceRequest.id</code> and <code>ImagingStudy.id</code>. The PNG overlay can ride as a base64 <code>presentedForm</code>. This is what closes the loop and lets the radiologist see the AI suggestion next to the order in Epic. See the <a href="#tab=architecture">Architecture</a> tab's request-flow diagram for where this fits.</p>
+  </div>
+
+  <h2>Optional &mdash; Azure Health Data Services DICOM service as a relay</h2>
+  <p>If your governance team wants the PHI dwell time, audit trail, and DICOMweb compliance contract in a managed Microsoft service rather than ad-hoc blob storage, drop the <strong>Azure Health Data Services (AHDS) DICOM service</strong> in between Vue and the CXRReportGen pipeline:</p>
+  <ul>
+    <li>Connector <strong>STOW-RS pushes</strong> DICOM instances into the AHDS DICOM service (instead of uploading raw <code>.dcm</code> to blob).</li>
+    <li>AHDS exposes a <strong>change feed</strong> that an Azure Function watches; on a new instance the function downloads the DICOM (or just its rendered frame via WADO-RS <code>frames/1/rendered</code>) and feeds CXRReportGen.</li>
+    <li>You get HIPAA-ready audit, DICOMcast for FHIR <code>ImagingStudy</code> generation, and a Microsoft-managed BAA-scoped DICOMweb endpoint inside your subscription.</li>
+  </ul>
+  <p>Cost: ~$0.40 per million DICOMweb requests + $0.018 / GB / mo for stored instances. See the <a href="https://learn.microsoft.com/en-us/azure/healthcare-apis/dicom/overview" target="_blank" rel="noopener">AHDS DICOM service docs</a>. We list this as <em>optional</em> because the blob-direct path in Patterns A/B is simpler and meets HIPAA when the storage account is configured as in <a href="#tab=walkthrough">Walkthrough Step 5b</a>.</p>
+
+  <h2>Networking &amp; security checklist</h2>
+  <table>
+    <thead><tr><th>Concern</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>PACS not on public internet</td><td>Site-to-site VPN or ExpressRoute from connector subnet to hospital VNet. <a href="#tab=networking">Networking tab</a> for diagram.</td></tr>
+      <tr><td>Secrets in code / env files</td><td>All PACS + Epic credentials in Key Vault; connector pulls via <code>DefaultAzureCredential</code>.</td></tr>
+      <tr><td>Blob auth</td><td>System-assigned managed identity on the connector + <em>Storage Blob Data Contributor</em> role on the DICOM storage account (already wired in Walkthrough Step 5b RBAC).</td></tr>
+      <tr><td>TLS to PACS</td><td>Pin the Vue server cert; reject self-signed in prod. If Vue presents a private-CA cert, mount the CA bundle on the connector and set <code>REQUESTS_CA_BUNDLE</code>.</td></tr>
+      <tr><td>PHI in transit</td><td>HTTPS end-to-end. Microsoft BAA covers Azure storage and AHDS. Vue-to-connector hop runs over the private VPN/ER circuit.</td></tr>
+      <tr><td>PHI at rest</td><td>Storage account from Step 5b enforces TLS1.2 + no public blob access + HTTPS only. Enable soft delete (7-30 days) and customer-managed keys if your governance team demands it.</td></tr>
+      <tr><td>Audit</td><td>Vue PACS audit log + Epic AuditEvent + Azure activity log + Foundry workspace diagnostic settings &rarr; Log Analytics workspace (auto-provisioned with the hub).</td></tr>
+      <tr><td>Multi-tenant isolation</td><td>One Foundry project per Epic tenant; per-project managed identity; per-project storage container or storage account.</td></tr>
+      <tr><td>De-identification</td><td>Optional &mdash; AHDS DICOM service has a built-in anonymizer, or run <code>dicom-anonymizer</code> in the connector before upload. Required for research use; usually not for clinical (BAA covers it).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Pitfalls and gotchas</h2>
+  <ul>
+    <li><strong>Compressed transfer syntaxes.</strong> Vue often returns JPEG 2000 (<code>1.2.840.10008.1.2.4.90/91</code>) or RLE-encoded pixel data. <code>pydicom</code> alone cannot decode these &mdash; install <code>pylibjpeg + pylibjpeg-libjpeg + pylibjpeg-openjpeg</code> so the toolkit's PNG step works. (Already in the install line above.)</li>
+    <li><strong>Study completion timing.</strong> Don't fire CXRReportGen on the first instance &mdash; wait until the study reports <code>ImagingStudy.status=available</code> (Epic) or until QIDO-RS instance count matches the modality's expected count. A 30-60s settle window is the standard pragmatic answer.</li>
+    <li><strong>Frontal + lateral pairing.</strong> CXRReportGen takes both views. Pair them by matching <code>SeriesInstanceUID</code> + <code>ViewPosition</code> tags (<code>PA</code>/<code>AP</code> = frontal; <code>LATERAL</code> = lateral). If a study has only frontal, you can still call the endpoint with just the frontal &mdash; the model handles missing lateral.</li>
+    <li><strong>Multi-frame DICOM.</strong> CR/DX (the primary CXR modalities) are single-frame. If you see a multi-frame instance (<code>NumberOfFrames &gt; 1</code>), it's almost certainly a different modality (CT, US) &mdash; skip or extract the first frame.</li>
+    <li><strong>Accession number reuse.</strong> Use <code>StudyInstanceUID</code> as the dedupe key, not <code>AccessionNumber</code> &mdash; some sites reuse accession numbers across encounters.</li>
+    <li><strong>FHIR paging.</strong> Epic returns <code>Bundle</code> with a <code>next</code> link; follow it. Default <code>_count</code> on Epic is often 100, max is 1000.</li>
+    <li><strong>Token TTL.</strong> Backend Services tokens are typically 30-60 min; cache them and refresh on 401, not on every call.</li>
+    <li><strong>Outbound from hospital.</strong> Some hospitals block outbound to Azure storage by IP; either NAT all egress through your VPN gateway or use <a href="https://learn.microsoft.com/en-us/azure/private-link/private-link-overview" target="_blank" rel="noopener">Private Link</a> for blob.</li>
+  </ul>
+
+  <h2>Mapping back to the CXRReportGen pipeline</h2>
+  <p>Both patterns leave you with files at <code>dicom-input/&lt;StudyInstanceUID&gt;/&lt;SOPInstanceUID&gt;.dcm</code>. From here, two equivalent inference paths exist:</p>
+  <ol>
+    <li><strong>Pull (batch):</strong> the inference worker from <a href="#tab=walkthrough">Walkthrough Step 12b</a> (<a href="assets/samples/blob_inference.py"><code>blob_inference.py</code></a>) lists the container and processes each study.</li>
+    <li><strong>Push (event-driven):</strong> an Event Grid subscription on <code>Microsoft.Storage.BlobCreated</code> fires an Azure Function per uploaded instance; the function waits for the matching lateral (debounce 30s), then calls the endpoint, writes JSON+Markdown+overlay PNG into <code>cxr-reports/&lt;StudyInstanceUID&gt;/</code>, and (in Pattern B) posts the <code>DiagnosticReport</code> back to Epic.</li>
+  </ol>
+  <p>Either way, the CXRReportGen endpoint itself doesn't change &mdash; the integration is purely additive on the ingestion side. See the <a href="#tab=architecture">Architecture</a> tab for the full sequence diagram.</p>
+
+  <h2>Quick links</h2>
+  <ul>
+    <li><a href="assets/samples/pacs_pull.py"><code>assets/samples/pacs_pull.py</code></a> &mdash; Pattern A polling worker.</li>
+    <li><a href="assets/samples/epic_imagingstudy_pull.py"><code>assets/samples/epic_imagingstudy_pull.py</code></a> &mdash; Pattern B Epic-driven worker.</li>
+    <li><a href="https://github.com/ImagingDataCommons/dicomweb-client" target="_blank" rel="noopener">dicomweb-client (Python)</a> &mdash; the DICOMweb SDK used in both samples.</li>
+    <li><a href="https://fhir.epic.com/Specifications?api=10005" target="_blank" rel="noopener">Epic FHIR R4 ImagingStudy spec</a> and <a href="https://fhir.epic.com/Documentation?docId=oauth2&amp;section=BackendOAuth2Guide" target="_blank" rel="noopener">Backend Services OAuth2 guide</a>.</li>
+    <li><a href="https://www.hyland.com/en/solutions/products/vue-pacs" target="_blank" rel="noopener">Hyland Vue PACS</a> &mdash; vendor product page (DICOMweb support details require Hyland community access).</li>
+    <li><a href="https://learn.microsoft.com/en-us/azure/healthcare-apis/dicom/overview" target="_blank" rel="noopener">Azure Health Data Services DICOM service</a> &mdash; if you want a managed DICOMweb relay.</li>
+  </ul>
+</section>
+
+<!-- =================== DICOM ===================
+ -->
 <section class="tab-panel" id="tab-dicom" role="tabpanel" aria-labelledby="tabbtn-dicom" tabindex="-1">
   <h1>DICOM Ingestion Pipeline</h1>
   <p class="lede"><strong>Yes — you can feed CXRReportGen <code>.dcm</code> files directly</strong> when you use Microsoft's official <code>healthcareai_toolkit</code>. The toolkit reads the DICOM, normalizes the pixel data, and base64-encodes a PNG for you. The HTTP endpoint itself only accepts base64 PNG/JPG inside the JSON payload — the toolkit does the DICOM→PNG step client-side, invisibly.</p>
