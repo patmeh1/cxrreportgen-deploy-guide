@@ -31,6 +31,7 @@
     <div class="nav-group" data-group="start">
       <button class="nav-group-toggle" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false" aria-controls="menu-start">Start</button>
       <div class="nav-group-menu" id="menu-start" role="menu" aria-label="Start">
+        <button class="tab-button" role="tab" data-tab="dicom-quickstart" aria-controls="tab-dicom-quickstart" id="tabbtn-dicom-quickstart">DICOM Receiver Quickstart</button>
         <button class="tab-button" role="tab" data-tab="overview"     aria-controls="tab-overview"     id="tabbtn-overview">Overview</button>
         <button class="tab-button" role="tab" data-tab="prereqs"      aria-controls="tab-prereqs"      id="tabbtn-prereqs">Prerequisites</button>
         <button class="tab-button" role="tab" data-tab="architecture" aria-controls="tab-architecture" id="tabbtn-architecture">Architecture</button>
@@ -75,6 +76,7 @@
 <div class="tab-select-wrap">
   <label for="tab-select" class="visually-hidden">Section</label>
   <select id="tab-select" aria-label="Jump to section">
+    <option value="dicom-quickstart">DICOM Receiver Quickstart</option>
     <option value="overview">Overview</option>
     <option value="walkthrough">End-to-End Walkthrough</option>
     <option value="script">All-in-one Script</option>
@@ -95,6 +97,277 @@
 </div>
 
 <main id="main">
+
+<!-- =================== DICOM Receiver Quickstart (default landing) =================== -->
+<section class="tab-panel" id="tab-dicom-quickstart" role="tabpanel" aria-labelledby="tabbtn-dicom-quickstart" tabindex="-1">
+  <h1>DICOM Receiver Quickstart &mdash; do this first</h1>
+  <p class="lede">Before you spin up the A100 endpoint, prove the plumbing end-to-end: receive a real DICOM study from a sender (PACS, modality, or test tool), land the bytes in Blob Storage, and emit a Service Bus message that says &ldquo;this study is ready to process.&rdquo; <strong>Two paths, ~25&ndash;45 min, under $1 in setup cost.</strong> When this loop works, the AI model in the <a href="#tab=walkthrough">End-to-End Walkthrough</a> just plugs in.</p>
+
+  <div class="callout">
+    <strong>Why do this before deploying the model.</strong> Most CXRReportGen pilots stall not because the model doesn't work, but because the radiology operations team can't reliably get DICOMs from PACS into Azure. Solving the receiver first means: (1) the imaging team's part is independently testable, (2) you can park bytes in storage while waiting on the A100 quota approval, and (3) when the model goes live, the only new thing is the worker &mdash; the plumbing is already proven.
+  </div>
+
+  <h2>What you'll build</h2>
+<pre><code class="language-mermaid">flowchart LR
+  P[Sender: PACS / modality / storescu / curl] -->|DICOM bytes| R{Pick a path}
+  R -->|Path A: DIMSE| R1[pynetdicom listener on Container Apps]
+  R -->|Path B: AHDS| R2[AHDS DICOM service]
+  R1 --> B
+  R1 --> SB
+  R2 --> EG[Event Grid system topic]
+  EG --> SB
+  EG --> F[Copy Function pulls via WADO-RS]
+  F --> B
+  B[(Blob Storage - dicom-input)]
+  SB[(Service Bus - cxr-studies queue)]
+  B -.->|next quickstart| W[CXR worker - later]
+  SB -.->|session id = StudyInstanceUID| W</code></pre>
+
+  <h2>Which path is right for you?</h2>
+  <table>
+    <thead><tr><th></th><th>Path A &mdash; DIMSE listener</th><th>Path B &mdash; AHDS DICOM service</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Setup time</strong></td><td>~25 min</td><td>~45 min</td></tr>
+      <tr><td><strong>Monthly idle cost</strong></td><td>~$15 (1 always-on small Container App + ACR Basic + Service Bus Standard)</td><td>~$60 (AHDS DICOM service has a fixed hourly meter even when idle) + ~$10 Service Bus</td></tr>
+      <tr><td><strong>PACS speaks</strong></td><td>DIMSE C-STORE (TCP 11112) &mdash; what nearly every PACS does natively</td><td>DICOMweb STOW-RS over HTTPS &mdash; modern PACS only (Philips Vue, Sectra, GE Centricity recent)</td></tr>
+      <tr><td><strong>Bytes land in</strong></td><td>Your storage account directly &mdash; you can open the blob and see the DICOM</td><td>AHDS-managed storage. Downstream worker fetches via WADO-RS, or a small Function copies to your blob</td></tr>
+      <tr><td><strong>PHI audit + CMK</strong></td><td>You implement (App Insights + storage diagnostics + customer-managed keys per service)</td><td>Built in &mdash; HIPAA BAA, audit logs to Log Analytics, CMK, private endpoint, FHIR-adjacent</td></tr>
+      <tr><td><strong>Recommended for</strong></td><td><strong>This quickstart.</strong> Fastest path to seeing bytes in your storage. Promote to production with AHDS later.</td><td>Production deployments serving real clinical PACS traffic, or pilots that already require PHI controls on day one.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Step 1 &mdash; Pre-flight <span class="muted">(2 min)</span></h2>
+<pre><code class="language-bash"># Tools (Mac/Linux/WSL): one-time install
+brew install azure-cli jq dcmtk     # macOS
+# sudo apt install azure-cli jq dcmtk    # Ubuntu/WSL
+
+az login
+az account set --subscription "&lt;your-subscription-name-or-id&gt;"
+
+# Variables used throughout this quickstart
+export SUB=$(az account show --query id -o tsv)
+export LOC="eastus"
+export RG="cxr-quickstart-rg"
+
+# Register the resource providers you'll need (idempotent)
+for ns in Microsoft.Storage Microsoft.ServiceBus Microsoft.HealthcareApis \
+          Microsoft.App Microsoft.ContainerRegistry Microsoft.EventGrid \
+          Microsoft.OperationalInsights Microsoft.Insights Microsoft.ManagedIdentity \
+          Microsoft.Network; do
+  az provider register --namespace $ns --wait
+done
+
+# Single resource group is the cleanup boundary
+az group create -n "$RG" -l "$LOC"
+</code></pre>
+
+  <h2>Step 2 &mdash; Storage account + dicom-input container <span class="muted">(2 min)</span></h2>
+<pre><code class="language-bash">export SA="cxrdicom$RANDOM"
+export IN_CONTAINER="dicom-input"
+export OUT_CONTAINER="cxr-reports"   # we won't use this in the quickstart but create it now
+
+az storage account create -g "$RG" -n "$SA" -l "$LOC" --sku Standard_LRS \
+  --kind StorageV2 --min-tls-version TLS1_2 \
+  --allow-blob-public-access false --allow-shared-key-access false
+
+az storage container create --account-name "$SA" -n "$IN_CONTAINER"  --auth-mode login
+az storage container create --account-name "$SA" -n "$OUT_CONTAINER" --auth-mode login
+
+# Let yourself read/write blobs from the CLI for verification later
+export SA_RID=$(az storage account show -g "$RG" -n "$SA" --query id -o tsv)
+export ME=$(az ad signed-in-user show --query id -o tsv)
+az role assignment create --assignee "$ME" --role "Storage Blob Data Contributor" --scope "$SA_RID"
+</code></pre>
+  <p>Shared-key access is off and public access is off &mdash; the only way in or out is Entra-authenticated. That's the PHI default; you can flip it on later if a tool absolutely needs SAS.</p>
+
+  <h2>Step 3 &mdash; Service Bus + sessions queue <span class="muted">(3 min)</span></h2>
+  <p>A DICOM study trickles in as multiple C-STOREs over seconds (one per SOP instance &mdash; PA, lateral, prior comparisons, scout). The downstream worker needs to know when the whole study has arrived so it doesn't run inference on a half-uploaded study. Service Bus <strong>sessions</strong> (FIFO, session-id locked) group all messages with the same <code>StudyInstanceUID</code>, so the worker debounces naturally.</p>
+<pre><code class="language-bash">export SB_NS="cxr-bus-$RANDOM"
+export SB_QUEUE="cxr-studies"
+
+az servicebus namespace create -g "$RG" -n "$SB_NS" -l "$LOC" --sku Standard
+az servicebus queue create -g "$RG" --namespace-name "$SB_NS" -n "$SB_QUEUE" \
+  --enable-session true --max-delivery-count 10 \
+  --lock-duration PT2M --default-message-time-to-live P1D
+
+export SB_RID=$(az servicebus queue show -g "$RG" --namespace-name "$SB_NS" -n "$SB_QUEUE" --query id -o tsv)
+export SB_FQDN="$SB_NS.servicebus.windows.net"
+</code></pre>
+
+  <h2>Step 4 &mdash; Stand up the receiver <span class="muted">(15&ndash;30 min)</span></h2>
+  <p>Pick the path you decided above. Both end at the same state: when a sender pushes a DICOM, it lands in <code>dicom-input</code> and a Service Bus message with <code>session_id = StudyInstanceUID</code> appears in <code>cxr-studies</code>.</p>
+
+  <div class="inner-tabs" data-inner-name="quickstart-receiver">
+    <button class="inner-tab-btn active" data-inner="qs-dimse" type="button">Path A &mdash; DIMSE listener (recommended)</button>
+    <button class="inner-tab-btn" data-inner="qs-ahds" type="button">Path B &mdash; AHDS DICOM service</button>
+  </div>
+
+  <div class="inner-tab-panel active" data-inner="qs-dimse">
+    <h3>Path A &mdash; pynetdicom C-STORE SCP on Container Apps</h3>
+    <p>One Python container that registers as a Storage SCP on TCP 11112, accepts associations from whitelisted calling AE Titles, and on each C-STORE writes the SOP instance to blob and posts to Service Bus. Reference source: <a href="assets/samples/dimse_listener.py" target="_blank" rel="noopener"><code>dimse_listener.py</code></a> + <a href="assets/samples/listener.Dockerfile" target="_blank" rel="noopener"><code>listener.Dockerfile</code></a>.</p>
+
+    <h4>4A.1 &mdash; Build the container image</h4>
+<pre><code class="language-bash">export ACR="cxracr$RANDOM"
+az acr create -g "$RG" -n "$ACR" --sku Basic --admin-enabled false
+
+# Fetch the two reference files locally (or clone the site repo)
+mkdir -p quickstart && cd quickstart
+curl -sSLO https://raw.githubusercontent.com/patmeh1/cxrreportgen-deploy-guide/main/docs/assets/samples/dimse_listener.py
+curl -sSLO https://raw.githubusercontent.com/patmeh1/cxrreportgen-deploy-guide/main/docs/assets/samples/listener.Dockerfile
+
+az acr build --registry "$ACR" --image cxr-dimse-listener:1.0 \
+  --file listener.Dockerfile .
+cd ..
+</code></pre>
+
+    <h4>4A.2 &mdash; Managed identity + role assignments</h4>
+<pre><code class="language-bash">export UAMI="cxr-quickstart-mi"
+az identity create -g "$RG" -n "$UAMI"
+export ID_RID=$(az identity show -g "$RG" -n "$UAMI" --query id -o tsv)
+export ID_CID=$(az identity show -g "$RG" -n "$UAMI" --query clientId -o tsv)
+
+# Write to blob + send to Service Bus + pull image from ACR
+az role assignment create --assignee "$ID_CID" --role "Storage Blob Data Contributor" --scope "$SA_RID"
+az role assignment create --assignee "$ID_CID" --role "Azure Service Bus Data Sender"   --scope "$SB_RID"
+az role assignment create --assignee "$ID_CID" --role "AcrPull" --scope "$(az acr show -n "$ACR" --query id -o tsv)"
+</code></pre>
+
+    <h4>4A.3 &mdash; Container Apps environment + the listener app</h4>
+<pre><code class="language-bash">export ACA_ENV="cxr-quickstart-env"
+# For the quickstart we use a public ACA environment so you can hit it from your laptop.
+# In production you'd pass --internal-only true --infrastructure-subnet-resource-id $SUBNET_ID
+az containerapp env create -g "$RG" -n "$ACA_ENV" -l "$LOC"
+
+az containerapp create -g "$RG" -n cxr-dimse-listener --environment "$ACA_ENV" \
+  --image "$ACR.azurecr.io/cxr-dimse-listener:1.0" \
+  --user-assigned "$ID_RID" \
+  --registry-server "$ACR.azurecr.io" --registry-identity "$ID_RID" \
+  --ingress external --transport tcp --target-port 11112 --exposed-port 11112 \
+  --min-replicas 1 --max-replicas 3 \
+  --env-vars STORAGE_ACCOUNT="$SA" SB_FQDN="$SB_FQDN" SB_QUEUE="$SB_QUEUE" \
+             AE_TITLE=CXR-INTAKE \
+             ALLOWED_CALLING_AES=QUICKSTART,VUEPACS_PROD \
+             INPUT_CONTAINER="$IN_CONTAINER" \
+             AZURE_CLIENT_ID="$ID_CID"
+
+# The hostname you'll point your sender at:
+export LISTENER_FQDN=$(az containerapp show -g "$RG" -n cxr-dimse-listener \
+  --query properties.configuration.ingress.fqdn -o tsv)
+echo "DICOM listener: $LISTENER_FQDN port 11112 (AE Title CXR-INTAKE)"
+</code></pre>
+    <div class="callout"><strong>Heads-up on public TCP ingress.</strong> External TCP on Container Apps is open to the internet on port 11112. Fine for a 30-min smoke test. Before any real PACS connects, swap to <code>--internal-only</code> on a VNet, expose via Azure Firewall or a Private Link Service, and let the AE Title whitelist (<code>ALLOWED_CALLING_AES</code>) do association-time filtering. See <a href="#tab=listener">DICOM Listener tab</a> &rarr; Networking checklist.</div>
+  </div>
+
+  <div class="inner-tab-panel" data-inner="qs-ahds">
+    <h3>Path B &mdash; Azure Health Data Services DICOM service</h3>
+    <p>Managed STOW-RS / WADO-RS / QIDO-RS endpoint with a built-in change feed wired to Event Grid. You don't operate any container; AHDS handles storage, audit, CMK, and private endpoint out of the box.</p>
+
+    <h4>4B.1 &mdash; AHDS workspace + DICOM service</h4>
+<pre><code class="language-bash">export WS="cxr-ahds"
+export DCM="cxr-dicom"
+
+az extension add -n healthcareapis --upgrade --only-show-errors
+az healthcareapis workspace create        -g "$RG" -n "$WS" -l "$LOC"
+az healthcareapis workspace dicomservice create        -g "$RG" --workspace-name "$WS" -n "$DCM"
+
+export DCM_RID=$(az healthcareapis workspace dicomservice show -g "$RG" --workspace-name "$WS" -n "$DCM" --query id -o tsv)
+export DCM_URI=$(az healthcareapis workspace dicomservice show -g "$RG" --workspace-name "$WS" -n "$DCM" --query serviceUrl -o tsv)
+echo "DICOMweb base URL: $DCM_URI"
+</code></pre>
+
+    <h4>4B.2 &mdash; Grant yourself DICOM Data Owner (so you can STOW-RS push from curl)</h4>
+<pre><code class="language-bash">az role assignment create --assignee "$ME" \
+  --role "DICOM Data Owner" --scope "$DCM_RID"
+</code></pre>
+
+    <h4>4B.3 &mdash; Wire the change feed: AHDS &rarr; Event Grid &rarr; Service Bus</h4>
+<pre><code class="language-bash">az eventgrid system-topic create -g "$RG" -n cxr-dicom-topic \
+  --topic-type Microsoft.HealthcareApis.DicomServices --source "$DCM_RID" -l "$LOC"
+
+az eventgrid system-topic event-subscription create \
+  -g "$RG" --system-topic-name cxr-dicom-topic -n cxr-imagestored-sub \
+  --endpoint-type servicebusqueue --endpoint "$SB_RID" \
+  --included-event-types "Microsoft.HealthcareApis.DicomImageCreated"
+</code></pre>
+    <p>Now every <code>DicomImageCreated</code> event lands on the Service Bus queue. A downstream worker (built in the End-to-End Walkthrough Step 16) reads the event, fetches the instance via WADO-RS (<code>$DCM_URI/v2/studies/{study}/series/{series}/instances/{instance}</code>), and either copies it to your <code>dicom-input</code> blob container or invokes CXRReportGen directly.</p>
+    <div class="callout"><strong>Optional copy-to-blob.</strong> If a downstream consumer expects bytes in <code>dicom-input</code> (instead of AHDS), add a tiny Function on the same Service Bus queue that does the WADO-RS pull and blob upload. Sample skeleton lives in the <a href="#tab=dicom">DICOM Ingestion tab</a> &rarr; Patterns.</div>
+  </div>
+
+  <h2>Step 5 &mdash; Smoke-test it with a real DICOM <span class="muted">(5 min)</span></h2>
+  <p>Grab the sample chest X-ray DICOM from the official healthcareai-examples and push it through. If you don't have <code>dcmtk</code>'s <code>storescu</code>, use <code>curl</code> against AHDS instead.</p>
+<pre><code class="language-bash"># Download an official sample DICOM (Microsoft healthcareai-examples)
+mkdir -p sample && cd sample
+curl -sSLO https://github.com/microsoft/healthcareai-examples/raw/main/data/IU-Xray/sample/CXR1_1_IM-0001-3001.dcm
+mv CXR1_1_IM-0001-3001.dcm sample.dcm
+cd ..
+</code></pre>
+
+  <h3>For Path A (DIMSE listener):</h3>
+<pre><code class="language-bash"># 1) Confirm the association handshake works (no data sent)
+echoscu -v -aet QUICKSTART -aec CXR-INTAKE "$LISTENER_FQDN" 11112
+
+# 2) Push the SOP instance
+storescu -v -aet QUICKSTART -aec CXR-INTAKE "$LISTENER_FQDN" 11112 sample/sample.dcm
+</code></pre>
+
+  <h3>For Path B (AHDS STOW-RS):</h3>
+<pre><code class="language-bash"># 1) Get a bearer token scoped to the DICOM service
+TOKEN=$(az account get-access-token --resource "$DCM_URI" --query accessToken -o tsv)
+
+# 2) STOW-RS push
+curl -X POST "$DCM_URI/v2/studies" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/dicom" \
+  --data-binary "@sample/sample.dcm"
+</code></pre>
+
+  <h2>Step 6 &mdash; Verify the round-trip <span class="muted">(2 min)</span></h2>
+  <p>If everything wired up, two things happened: the SOP instance landed somewhere durable (your blob for Path A, AHDS for Path B), <em>and</em> a Service Bus message appeared with the StudyInstanceUID as session id.</p>
+<pre><code class="language-bash"># --- Path A: see the bytes in your blob ---
+az storage blob list --account-name "$SA" --container-name "$IN_CONTAINER" \
+  --auth-mode login -o table
+
+# --- Path B: query AHDS for the study you just pushed ---
+TOKEN=$(az account get-access-token --resource "$DCM_URI" --query accessToken -o tsv)
+curl -s "$DCM_URI/v2/studies" -H "Authorization: Bearer $TOKEN" | jq '.[] | {StudyInstanceUID: ."0020000D".Value[0], Modality: ."00080061".Value[0]}'
+
+# --- Both paths: confirm the message landed on the queue ---
+az servicebus queue show -g "$RG" --namespace-name "$SB_NS" -n "$SB_QUEUE" \
+  --query "{active:countDetails.activeMessageCount, dlq:countDetails.deadLetterMessageCount}" -o table
+
+# --- Tail the listener logs (Path A only) ---
+az containerapp logs show -g "$RG" -n cxr-dimse-listener --follow
+</code></pre>
+  <p>Expected: at least one blob (Path A) or one study returned by QIDO (Path B), and <code>active</code> on the queue going from 0 to 1 within a few seconds of the push.</p>
+
+  <h2>Troubleshooting cheat-sheet</h2>
+  <table>
+    <thead><tr><th>Symptom</th><th>Most likely cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td><code>echoscu</code> times out (Path A)</td><td>Container App is still spinning up <em>or</em> port 11112 isn't reachable from your network</td><td><code>az containerapp show ... --query properties.runningStatus</code> &mdash; wait for <code>Running</code>. Check corporate firewall allows outbound TCP/11112.</td></tr>
+      <tr><td><code>storescu</code> connects but rejects with &quot;Calling AE Title not recognized&quot;</td><td>Your sender's AE Title isn't in <code>ALLOWED_CALLING_AES</code></td><td>Update the env var: <code>az containerapp update --set-env-vars ALLOWED_CALLING_AES=QUICKSTART,VUEPACS_PROD,NEW_AE</code></td></tr>
+      <tr><td>STOW-RS returns 401 (Path B)</td><td>You don't have <strong>DICOM Data Owner</strong> on the service, or the token is for the wrong audience</td><td>Re-run the role assignment in Step 4B.2. Pass <code>--resource "$DCM_URI"</code> (no trailing slash) to <code>get-access-token</code>.</td></tr>
+      <tr><td>STOW-RS returns 409</td><td>The same SOP instance is already in AHDS</td><td>This is fine &mdash; AHDS dedups by SOPInstanceUID. The Event Grid event still fires.</td></tr>
+      <tr><td>Blob shows up but queue stays at 0</td><td>Listener wrote the blob but the SB send call failed (likely missing role)</td><td>Confirm the <strong>Azure Service Bus Data Sender</strong> role on <code>$ID_CID</code> at scope <code>$SB_RID</code>.</td></tr>
+      <tr><td>Event Grid subscription stuck in <code>AwaitingManualAction</code></td><td>System topic registration race</td><td>Re-run the <code>az eventgrid system-topic event-subscription create</code> after 60s.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>What this just proved &mdash; and what's next</h2>
+  <ul>
+    <li><strong>You proved:</strong> a DICOM sender can reach Azure, bytes land in durable storage, and a worker (any worker, doesn't matter which) can be triggered when a study is ready &mdash; with the StudyInstanceUID already grouped for it.</li>
+    <li><strong>The imaging team can now</strong> register a destination in their PACS (Vue, Sectra, GE) pointing at <code>$LISTENER_FQDN</code> AE Title <code>CXR-INTAKE</code> (Path A) or <code>$DCM_URI/v2/studies</code> (Path B). See the <a href="#tab=pacs">Vue PACS &amp; Epic tab</a> for the per-vendor routing-rule recipes.</li>
+    <li><strong>You can now safely</strong> go fight for A100 quota in parallel &mdash; the receiver runs without it.</li>
+    <li><strong>When the A100 lands</strong> head to the <a href="#tab=walkthrough">End-to-End Walkthrough</a>. Steps 0&ndash;13 deploy the model; Steps 14&ndash;16 connect it to the queue you just provisioned, and Step 16's worker plus this quickstart's receiver are the full production loop.</li>
+    <li><strong>For deeper receiver topics</strong> (TLS for DIMSE, customer-managed keys on Service Bus, ExpressRoute, association-rate limiting) read the <a href="#tab=listener">DICOM Listener tab</a>.</li>
+  </ul>
+
+  <h2>Tear-down <span class="muted">(30 s &mdash; do this when you're done experimenting!)</span></h2>
+<pre><code class="language-bash"># Stops every meter touched by the quickstart
+az group delete -n "$RG" -y --no-wait
+</code></pre>
+  <p>Total quickstart cost if you finish in one sitting and delete the RG within an hour: usually <strong>under $1</strong>. AHDS DICOM service has a per-hour baseline (~$0.08/hour for the lowest tier in East US) so don't leave Path B running over the weekend.</p>
+</section>
 
 <!-- =================== Overview =================== -->
 <section class="tab-panel" id="tab-overview" role="tabpanel" aria-labelledby="tabbtn-overview" tabindex="-1">

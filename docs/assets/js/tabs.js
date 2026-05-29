@@ -133,7 +133,7 @@
     return (location.hash.match(/tab=([\w-]+)/) || [])[1];
   }
   const fromHash = tabFromHash();
-  show(fromHash && document.getElementById('tab-' + fromHash) ? fromHash : 'overview', false);
+  show(fromHash && document.getElementById('tab-' + fromHash) ? fromHash : 'dicom-quickstart', false);
 
   // In-page <a href="#tab=X"> links + browser back/forward
   window.addEventListener('hashchange', () => {
