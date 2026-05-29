@@ -281,7 +281,7 @@ az servicebus queue show -g "$RG" --namespace-name "$SB_NS" -n "$SB_QUEUE" \
 <pre><code class="language-bash"># Stops every meter touched by the quickstart
 az group delete -n "$RG" -y --no-wait
 </code></pre>
-  <p>Total quickstart cost if you finish in one sitting and delete the RG within an hour: usually <strong>under $1</strong>. AHDS DICOM service has a per-hour baseline (~$0.08/hour for the lowest tier in East US) so don't leave the resource group running over the weekend.</p>
+  <p>Total quickstart cost if you finish in one sitting and delete the RG within an hour: usually <strong>under $1</strong>. AHDS DICOM is consumption-based (per-GB storage + per-transaction), so an idle DICOM service costs essentially nothing — the only fixed meter you incur while idle is the <strong>Service Bus Standard namespace</strong> (~$10/month flat). Delete the resource group to stop all charges.</p>
 </section>
 
 <!-- =================== Overview =================== -->
@@ -2772,7 +2772,7 @@ go.onclick = async () =&gt; {
 <!-- =================== Cost Calculator =================== -->
 <section class="tab-panel" id="tab-cost-calculator" role="tabpanel" aria-labelledby="tabbtn-cost-calculator" tabindex="-1">
   <h1>Cost Calculator</h1>
-  <p class="lede">Client-side estimator that adapts to your DICOM volume, retention policy, networking choices, and Foundry add-ons. <span id="rates-stamp" style="color: var(--fg-muted)"></span></p>
+  <p class="lede">Client-side estimator covering the full pipeline — DICOM receiver (AHDS + Service Bus + Event Grid), Container Apps worker, AML endpoint compute, storage, networking, and Foundry add-ons. <span id="rates-stamp" style="color: var(--fg-muted)"></span></p>
 
   <div class="calc-grid">
     <form class="calc-controls" onsubmit="event.preventDefault()">
@@ -2789,7 +2789,7 @@ go.onclick = async () =&gt; {
         <div class="calc-row"><label for="hot_days">Hot tier (days)</label><input id="hot_days" type="number" min="0" value="30"></div>
         <div class="calc-row"><label for="cool_days">Cool tier (days)</label><input id="cool_days" type="number" min="0" value="90"></div>
         <div class="calc-row"><label for="archive_days">Archive tier (days)</label><input id="archive_days" type="number" min="0" value="2555"></div>
-        <div class="calc-row inline"><input id="phi_deid" type="checkbox" checked><label for="phi_deid">Enable Azure Health Data Services (DICOM + De-id)</label></div>
+        <div class="calc-row inline"><input id="phi_deid" type="checkbox" checked><label for="phi_deid">Enable DICOM receiver pipeline (AHDS DICOM + Service Bus + Event Grid)</label></div>
       </fieldset>
 
       <fieldset><legend>Compute</legend>

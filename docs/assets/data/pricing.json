@@ -1,9 +1,9 @@
 {
   "_meta": {
     "currency": "USD",
-    "last_verified": "2026-05-27",
+    "last_verified": "2026-05-28",
     "source": "Placeholder rates. Validate against https://azure.microsoft.com/pricing/calculator/ before quoting customers.",
-    "schema_version": "1.0.0"
+    "schema_version": "1.1.0"
   },
   "regions": {
     "eastus":         { "label": "East US",         "modifier": 1.00 },
@@ -50,7 +50,16 @@
   "azure_health_data_services": {
     "dicom_storage_per_gb_month": 0.107,
     "dicom_per_10k_transactions": 0.50,
-    "deid_per_instance_hour": 1.20
+    "deid_per_instance_hour": 0.00
+  },
+  "service_bus": {
+    "standard_base_month": 9.81,
+    "standard_ops_per_million": 0.80,
+    "free_ops_per_million": 13.0
+  },
+  "event_grid": {
+    "ops_per_million": 0.60,
+    "free_ops_per_month": 100000
   },
   "container_apps": {
     "vcpu_second": 0.000024,

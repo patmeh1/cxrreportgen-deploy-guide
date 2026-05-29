@@ -160,16 +160,29 @@
       cosmos = (input.cosmos_rus / 100) * 730 * pricing.cosmos_db.ru_per_100_per_hour + 1 * pricing.cosmos_db.storage_per_gb_month;
     }
 
-    // PHI de-id (Azure Health Data Services DICOM + De-id)
-    let hds = 0;
+    // DICOM receiver pipeline: AHDS DICOM service + Service Bus (sessions queue) + Event Grid (system topic)
+    let hds = 0, sb = 0, eg = 0;
     if (input.phi_deid) {
+      // AHDS DICOM service: storage + transactions. (De-id is consumption-based and not modeled here.)
+      const dicom_tx_per_instance = 6; // store + retrieve metadata + WADO + change-feed events
       hds =
         dicom_gb_month * pricing.azure_health_data_services.dicom_storage_per_gb_month +
-        (inferences_month * input.images_study * 6 / 10000) * pricing.azure_health_data_services.dicom_per_10k_transactions +
-        hoursMonth * pricing.azure_health_data_services.deid_per_instance_hour;
+        (inferences_month * input.images_study * dicom_tx_per_instance / 10000) * pricing.azure_health_data_services.dicom_per_10k_transactions;
+
+      // Service Bus Standard sessions queue: flat base + per-million ops above the included free tier
+      const sb_ops = inferences_month * input.images_study * 2; // 1 enqueue (from EG subscription) + 1 dequeue (worker)
+      const sb_ops_millions = sb_ops / 1_000_000;
+      const sb_billable_millions = Math.max(0, sb_ops_millions - (pricing.service_bus.free_ops_per_million || 0));
+      sb = pricing.service_bus.standard_base_month + sb_billable_millions * pricing.service_bus.standard_ops_per_million;
+
+      // Event Grid system topic: 1 event per arriving DICOM instance; first 100k ops/month free
+      const eg_ops = inferences_month * input.images_study;
+      const eg_billable = Math.max(0, eg_ops - (pricing.event_grid.free_ops_per_month || 0));
+      eg = (eg_billable / 1_000_000) * pricing.event_grid.ops_per_million;
     }
 
-    // Container Apps ingestion job (assume 2 vCPU x 4 GiB, 4s per study)
+    // Container Apps DICOM worker: reads SB sessions, pulls DICOM from AHDS, posts to AML endpoint
+    // (assume 2 vCPU x 4 GiB, 4s per study)
     const seconds = inferences_month * input.images_study * 4;
     const containerApps =
       seconds * 2 * pricing.container_apps.vcpu_second +
@@ -189,8 +202,10 @@
       ['Log Analytics ingestion', logAnalytics],
       ['Azure AI Search', aiSearch],
       ['Azure Cosmos DB', cosmos],
-      ['Azure Health Data Services (DICOM + De-id)', hds],
-      ['Container Apps (ingestion job)', containerApps],
+      ['Azure Health Data Services (DICOM)', hds],
+      ['Service Bus (sessions queue, Standard)', sb],
+      ['Event Grid (DICOM events)', eg],
+      ['Container Apps (DICOM worker)', containerApps],
       ['Support plan', support],
       ['Microsoft Defender for Cloud', defender]
     ];
